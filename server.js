@@ -1,12 +1,14 @@
 const express = require('express');
-const multer = require('multer');
 const path = require('path');
 const fs = require('fs').promises;
 const fsSync = require('fs');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const ffmpeg = require('fluent-ffmpeg');
+const FormData = require('form-data');
+const axios = require('axios'); // 新增
 
+// 配置 ffmpeg 路径
 ffmpeg.setFfmpegPath('D:\\data\\ffmpeg-8.1.1-full_build\\ffmpeg-8.1.1-full_build\\bin\\ffmpeg.exe');
 ffmpeg.setFfprobePath('D:\\data\\ffmpeg-8.1.1-full_build\\ffmpeg-8.1.1-full_build\\bin\\ffprobe.exe');
 
@@ -22,26 +24,39 @@ async function ensureDirectories() {
   try {
     await fs.mkdir(UPLOADS_DIR, { recursive: true });
     await fs.mkdir(CHUNKS_DIR, { recursive: true });
-    console.log('Directories ready');
+    console.log('✅ Directories ready');
   } catch (error) {
-    console.error('Directory error:', error);
+    console.error('❌ Directory error:', error);
   }
 }
 
-// 中间件 - 简化配置
-app.use(cors());
+// 中间件配置
+app.use(cors({
+  origin: '*',
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // 存储上传会话信息
 const uploadSessions = new Map();
 
+// 健康检查
 app.get('/health', (req, res) => {
-  res.json({ status: 'OK', message: 'Server is running' });
+  res.json({ 
+    status: 'OK', 
+    message: 'Server is running',
+    timestamp: new Date().toISOString(),
+    uploadSessions: uploadSessions.size,
+    nodeVersion: process.version
+  });
 });
 
-// === 分块上传路由 ===
+// 初始化上传会话
 app.post('/init-upload', async (req, res) => {
-  console.log('Received init-upload request');
   try {
     const { fileName, fileSize, totalChunks } = req.body;
     
@@ -63,23 +78,24 @@ app.post('/init-upload', async (req, res) => {
       createdAt: Date.now()
     });
 
-    console.log(`Upload session created: ${sessionId}`);
+    console.log(`📁 Upload session created: ${sessionId}`);
     res.json({ 
       success: true, 
       sessionId,
       fileName: uniqueFileName
     });
   } catch (error) {
-    console.error('Init upload error:', error);
+    console.error('❌ Init upload error:', error);
     res.status(500).json({ 
       error: 'Failed to initialize upload',
-      success: false
+      success: false,
+      details: error.message
     });
   }
 });
 
+// 上传分块
 app.post('/upload-chunk', async (req, res) => {
-  console.log('Received upload-chunk request');
   try {
     const { sessionId, chunkIndex, chunkData } = req.body;
     
@@ -103,22 +119,50 @@ app.post('/upload-chunk', async (req, res) => {
     await fs.writeFile(chunkPath, Buffer.from(chunkData, 'base64'));
 
     session.uploadedChunks.add(chunkIndexNum);
-    console.log(`Chunk ${chunkIndexNum} uploaded for session ${sessionId}`);
+    console.log(`📤 Chunk ${chunkIndexNum} uploaded for session ${sessionId}`);
 
     res.json({ 
       success: true, 
-      message: `Chunk ${chunkIndexNum} uploaded successfully`
+      message: `Chunk ${chunkIndexNum} uploaded successfully`,
+      progress: `${session.uploadedChunks.size}/${session.totalChunks}`
     });
   } catch (error) {
-    console.error('Upload chunk error:', error);
+    console.error('❌ Upload chunk error:', error);
     res.status(500).json({ 
       error: 'Failed to upload chunk',
-      success: false
+      success: false,
+      details: error.message
     });
   }
 });
 
-// === 修改 merge-and-analyze 路由 ===
+// 获取已上传分块
+app.get('/get-uploaded-chunks/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  
+  if (!sessionId) {
+    return res.status(400).json({ 
+      error: 'Missing session ID',
+      success: false
+    });
+  }
+
+  const session = uploadSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ 
+      error: 'Upload session not found',
+      success: false
+    });
+  }
+
+  res.json({
+    success: true,
+    uploadedChunks: Array.from(session.uploadedChunks),
+    totalChunks: session.totalChunks
+  });
+});
+
+// 合并分块并分析 - 修复版本（使用 axios）
 app.post('/merge-and-analyze', async (req, res) => {
   console.log('Received merge-and-analyze request');
   try {
@@ -159,64 +203,108 @@ app.post('/merge-and-analyze', async (req, res) => {
     
     writeStream.end();
 
-    // 清理会话
-    uploadSessions.delete(sessionId);
-
-    // === 新增：生成缩略图 ===
-    const thumbnailPath = path.join(UPLOADS_DIR, `${session.fileName}_thumb.jpg`);
-    
-    // 使用 ffmpeg 提取第一帧作为缩略图
-    await new Promise((resolve, reject) => {
-      ffmpeg(outputPath)
-        .on('end', resolve)
-        .on('error', reject)
-        .screenshots({
-          count: 1,
-          folder: UPLOADS_DIR,
-          filename: `${session.fileName}_thumb.jpg`,
-          size: '120x80'
-        });
+    await new Promise((resolve) => {
+      writeStream.on('finish', resolve);
+      writeStream.on('error', resolve);
     });
 
-    console.log('Thumbnail generated:', thumbnailPath);
+    uploadSessions.delete(sessionId);
 
-    // 模拟分析（实际项目中这里会调用真正的 AI 分析）
-    const mockResults = {
+    console.log('✅ File merged successfully:', outputPath);
+
+    // === 调用 FastAPI 后端进行真实分析 ===
+    console.log('🚀 Calling FastAPI backend (http://localhost:8001/analyze-barbell)...');
+    
+    const formData = new FormData();
+    const videoBuffer = await fs.readFile(outputPath);
+    
+    formData.append('video', videoBuffer, {
+      filename: session.fileName,
+      contentType: 'video/mp4'
+    });
+
+    const response = await axios.post(
+      'http://localhost:8001/analyze-barbell',
+      formData,
+      {
+        headers: {
+          ...formData.getHeaders(),
+          'Content-Type': `multipart/form-data; boundary=${formData.getBoundary()}`
+        },
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
+        timeout: 300000
+      }
+    );
+
+    console.log('✅ Analysis completed!');
+    console.log('   Exercise Type:', response.data.exercise_type);
+    console.log('   Score:', response.data.score);
+    console.log('   Stability:', response.data.stability);
+
+    res.json({
       success: true,
-      analysis_id: uuidv4(),
-      exercise_type: ['Bench Press', 'Squat', 'Deadlift'][Math.floor(Math.random() * 3)],
-      score: Math.floor(80 + Math.random() * 20),
-      stability: `${(80 + Math.random() * 20).toFixed(1)}%`,
-      offset: Math.random() > 0.5 
-        ? `左偏 ${(1 + Math.random() * 5).toFixed(1)}cm` 
-        : `右偏 ${(1 + Math.random() * 5).toFixed(1)}cm`,
-      message: 'AI 分析完成！',
-      // === 新增：返回缩略图路径 ===
-      thumbnailUrl: `/uploads/${session.fileName}_thumb.jpg`
-    };
-
-    res.json(mockResults);
+      analysis_id: response.data.analysis_id,
+      exercise_type: response.data.exercise_type,
+      score: response.data.score,
+      stability: response.data.stability,
+      offset: response.data.offset,
+      avg_speed: response.data.avg_speed,
+      max_speed: response.data.max_speed,
+      sticking_point: response.data.sticking_point,
+      rpe: response.data.rpe,
+      feedback: response.data.feedback,
+      thumbnailUrl: response.data.thumbnailUrl,
+      videoUrl: response.data.videoUrl,
+      trajectory: response.data.trajectory
+    });
 
   } catch (error) {
-    console.error('Merge error:', error);
+    console.error('❌ Merge and analysis error:', error);
+    
+    let errorMessage = 'Failed to merge and analyze';
+    if (error.response) {
+      console.error('FastAPI error response:', error.response.data);
+      errorMessage = `FastAPI error: ${JSON.stringify(error.response.data)}`;
+    } else if (error.code === 'ECONNREFUSED') {
+      errorMessage = '无法连接到 FastAPI 后端';
+    } else {
+      errorMessage = error.message;
+    }
+    
     res.status(500).json({ 
-      error: 'Failed to merge and analyze',
-      success: false
+      error: errorMessage,
+      success: false,
+      details: error.message
     });
   }
 });
 
-// === 新增：提供静态文件服务 ===
-app.use('/uploads', express.static(UPLOADS_DIR));
+// 静态文件服务
+app.use('/uploads', express.static(UPLOADS_DIR, {
+  maxAge: '1d',
+  setHeaders: (res) => {
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+  }
+}));
 
 // 启动服务器
 ensureDirectories().then(() => {
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
-    console.log('Available endpoints:');
-    console.log(`GET  /health`);
-    console.log(`POST /init-upload`);
-    console.log(`POST /upload-chunk`);
-    console.log(`POST /merge-and-analyze`);
+    console.log(`\n` + '='.repeat(60));
+    console.log('🚀 Server running on http://0.0.0.0:' + PORT);
+    console.log('='.repeat(60));
+    console.log('\n📋 Available endpoints:');
+    console.log('   GET  /health');
+    console.log('   POST /init-upload');
+    console.log('   POST /upload-chunk');
+    console.log('   GET  /get-uploaded-chunks/:sessionId');
+    console.log('   POST /merge-and-analyze');
+    console.log('   GET  /uploads/* (static files)');
+    console.log('\n🔧 Configuration:');
+    console.log('   Node.js Version:', process.version);
+    console.log('   FastAPI Backend: http://localhost:8001');
+    console.log('   Uploads Directory:', UPLOADS_DIR);
+    console.log('='.repeat(60) + '\n');
   });
 });
