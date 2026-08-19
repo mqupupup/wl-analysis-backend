@@ -135,11 +135,11 @@ def detect_bounce(rep: RepContext) -> ErrorDetection:
 
 
 def detect_hip_lift(rep: RepContext) -> ErrorDetection:
-    """需要髋部角度数据，当前不可用"""
+    """需要髋部角度数据，当前不可用。注意：应检测臀部离凳(butt-off)，而非单纯起桥(arch)。"""
     return ErrorDetection(
-        "bench_hip_lift", rep.rep_index,
+        "bench_butt_off_bench", rep.rep_index,
         ErrorStatus.INSUFFICIENT_DATA,
-        detail="需要髋部角度数据，当前不可用",
+        detail="需要髋部/臀部接触数据，当前不可用",
         confidence=0.0,
     )
 
@@ -238,6 +238,6 @@ class ErrorDetectionEngineFixed:
             "bench_incomplete_lockout": "锁定不完全",
             "bench_elbow_flare": "肘部外展",
             "bench_bounce": "砸胸/弹胸",
-            "bench_hip_lift": "臀部抬起",
+            "bench_butt_off_bench": "臀部离凳",
             "bench_asymmetric_push": "左右发力不对称",
         }.get(eid, eid)

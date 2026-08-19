@@ -247,19 +247,21 @@ class ExerciseKnowledgeValidator:
         if "primary_muscles" in meta and not isinstance(meta["primary_muscles"], list):
             result.add_error(f"{prefix}.primary_muscles", "primary_muscles 应为数组")
 
-        if "typical_rom" in meta:
-            rom = meta["typical_rom"]
+        # operational_rom_range（新）/ typical_rom（旧，兼容）
+        rom_key = "operational_rom_range" if "operational_rom_range" in meta else "typical_rom" if "typical_rom" in meta else None
+        if rom_key:
+            rom = meta[rom_key]
             if not isinstance(rom, dict):
-                result.add_error(f"{prefix}.typical_rom", "typical_rom 应为对象")
+                result.add_error(f"{prefix}.{rom_key}", f"{rom_key} 应为对象")
             else:
                 for joint, range_val in rom.items():
                     if not isinstance(range_val, dict):
-                        result.add_error(f"{prefix}.typical_rom.{joint}", "应为 {min, max} 对象")
+                        result.add_error(f"{prefix}.{rom_key}.{joint}", "应为 {min, max} 对象")
                     elif "min" not in range_val or "max" not in range_val:
-                        result.add_error(f"{prefix}.typical_rom.{joint}", "缺少 min 或 max")
+                        result.add_error(f"{prefix}.{rom_key}.{joint}", "缺少 min 或 max")
                     elif range_val.get("min", 0) >= range_val.get("max", 0):
                         result.add_error(
-                            f"{prefix}.typical_rom.{joint}",
+                            f"{prefix}.{rom_key}.{joint}",
                             f"min ({range_val['min']}) 应小于 max ({range_val['max']})"
                         )
 
@@ -380,6 +382,20 @@ class ExerciseKnowledgeValidator:
                 result.add_error(f"{kp_prefix}.weight", f"weight ({weight}) 应在 0-1 之间")
             else:
                 total_weight += weight
+
+            # source_type 校验
+            if "source_type" in kp:
+                valid_sources = {"official_rule", "research", "heuristic", "product_policy"}
+                if kp["source_type"] not in valid_sources:
+                    result.add_warning(
+                        f"{kp_prefix}.source_type",
+                        f"source_type '{kp['source_type']}' 不在推荐值中: {sorted(valid_sources)}"
+                    )
+            else:
+                result.add_warning(
+                    f"{kp_prefix}.source_type",
+                    "添加 source_type 字段（official_rule/research/heuristic/product_policy），明确规则来源层级"
+                )
 
             # measure 结构
             if "measure" in kp:
@@ -537,12 +553,22 @@ class ExerciseKnowledgeValidator:
                                     "改为负值如 -10"
                                 )
 
-            # injury_risk
-            if "injury_risk" in err:
-                if not isinstance(err["injury_risk"], list):
-                    result.add_error(f"{err_prefix}.injury_risk", "应为数组")
-                elif len(err["injury_risk"]) == 0:
-                    result.add_warning(f"{err_prefix}.injury_risk", "injury_risk 为空")
+            # risk_note（新）/ injury_risk（旧，兼容）
+            risk_key = "risk_note" if "risk_note" in err else "injury_risk" if "injury_risk" in err else None
+            if risk_key:
+                if not isinstance(err[risk_key], list):
+                    result.add_error(f"{err_prefix}.{risk_key}", "应为数组")
+                elif len(err[risk_key]) == 0:
+                    result.add_warning(f"{err_prefix}.{risk_key}", f"{risk_key} 为空（可接受，表示无特殊风险提示）")
+
+            # source_type 校验
+            if "source_type" in err:
+                valid_sources = {"official_rule", "research", "heuristic", "product_policy"}
+                if err["source_type"] not in valid_sources:
+                    result.add_warning(
+                        f"{err_prefix}.source_type",
+                        f"source_type '{err['source_type']}' 不在推荐值中: {sorted(valid_sources)}"
+                    )
 
             # fix_exercises
             if "fix_exercises" in err:
@@ -739,10 +765,11 @@ class ExerciseKnowledgeValidator:
                                 f"阶段 '{p}' 未在 phases.states 中定义"
                             )
 
-        # 3. rep_detection.primary_angle 应在 typical_rom 中有对应
+        # 3. rep_detection.primary_angle 应在 operational_rom_range/typical_rom 中有对应
         if "rep_detection" in data and "meta" in data:
             primary = data["rep_detection"].get("primary_angle", "")
-            rom = data["meta"].get("typical_rom", {})
+            rom = data["meta"].get("operational_rom_range", data["meta"].get("typical_rom", {}))
+            rom_key = "operational_rom_range" if "operational_rom_range" in data["meta"] else "typical_rom"
             # 尝试匹配
             matched = False
             for joint in rom.keys():
@@ -752,8 +779,8 @@ class ExerciseKnowledgeValidator:
             if not matched and rom:
                 result.add_warning(
                     "rep_detection.primary_angle",
-                    f"primary_angle '{primary}' 在 meta.typical_rom 中无直接对应",
-                    f"typical_rom 定义了: {sorted(rom.keys())}"
+                    f"primary_angle '{primary}' 在 meta.{rom_key} 中无直接对应",
+                    f"{rom_key} 定义了: {sorted(rom.keys())}"
                 )
 
         # 4. errors 的 severity 分布检查
