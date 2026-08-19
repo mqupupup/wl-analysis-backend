@@ -146,23 +146,37 @@ def detect_hip_lift(rep: RepContext) -> ErrorDetection:
 
 def detect_asymmetric_push(rep: RepContext, max_asym: float = 12.0) -> ErrorDetection:
     eid = "bench_asymmetric_push"
+
+    # 关键修复：双侧有效比例不足时，绝对不能判定"左右不对称"
+    # 这是"测不到"，不是"做得差"
+    bilateral = float(getattr(rep, "bilateral_valid_ratio", 0.0))
+    if bilateral < 0.65:
+        return ErrorDetection(
+            eid, rep.rep_index, ErrorStatus.INSUFFICIENT_DATA,
+            detail=f"双侧有效比例不足: {bilateral:.2f} (<0.65)，跳过对称性判断",
+            confidence=0.0,
+        )
+
     if rep.left_elbow is None or rep.right_elbow is None:
         return ErrorDetection(eid, rep.rep_index, ErrorStatus.INSUFFICIENT_DATA,
                               detail="缺少单侧数据")
 
     cs = max(0, rep.concentric_start - rep.start_frame)
     ce = min(len(rep.left_elbow), rep.concentric_end - rep.start_frame)
-    if ce - cs < 2:
-        return ErrorDetection(eid, rep.rep_index, ErrorStatus.INSUFFICIENT_DATA)
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        lm = float(np.nanmean(rep.left_elbow[cs: ce]))
-        rm = float(np.nanmean(rep.right_elbow[cs: ce]))
-    if not np.isfinite(lm) or not np.isfinite(rm):
+    if ce - cs < 5:
         return ErrorDetection(eid, rep.rep_index, ErrorStatus.INSUFFICIENT_DATA,
-                              detail="单侧数据全为 NaN")
-    asym = abs(lm - rm)
+                              detail="concentric 有效帧不足")
+
+    seg_l = np.asarray(rep.left_elbow[cs: ce], dtype=float)
+    seg_r = np.asarray(rep.right_elbow[cs: ce], dtype=float)
+    valid = np.isfinite(seg_l) & np.isfinite(seg_r)
+
+    if valid.sum() < 5:
+        return ErrorDetection(eid, rep.rep_index, ErrorStatus.INSUFFICIENT_DATA,
+                              detail="双侧同时有效帧不足")
+
+    # 用 median 替代 mean，抗异常帧
+    asym = float(np.nanmedian(np.abs(seg_l[valid] - seg_r[valid])))
 
     if asym > max_asym:
         sev = ErrorSeverity.SEVERE if asym > max_asym * 2 else ErrorSeverity.MODERATE

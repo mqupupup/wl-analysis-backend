@@ -1,13 +1,19 @@
 """
-exercise_specific_scorer_v2.py (v2)
+exercise_specific_scorer_v2.py (V3 语义修复版)
 
-修正：
-  - bar_path 严格切 concentric 段
-  - 缺数据 → score=None, status=INSUFFICIENT_DATA
-  - 动态权重归一化
+修复清单：
+  1. 删除错误指标：bar_path(肘角std) / elbow_tuck(肘角) / touch_point(肘角std)
+  2. power → concentric_speed（角速度不是功率）
+  3. joint_stress → depth_control（肘角≠关节应力，且修复不连续）
+  4. symmetry 加 bilateral_valid_ratio 门槛，数据不足=N/A 不扣分
+  5. ROM 用连续评分，不再 abs(rom-80) 扣分
+  6. velocity_smoothness 用 MAD 替代 std，抗噪
+  7. Score / Error / Data Quality 三者分离
+  8. 缺数据 => N/A，不参与加权
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
 import numpy as np
@@ -16,6 +22,10 @@ import warnings
 from app.domain.models import RepContext
 from app.domain.enums import ValidationStatus, MetricStatus
 
+
+# ═══════════════════════════════════════
+#  Data classes
+# ═══════════════════════════════════════
 
 @dataclass
 class MetricResult:
@@ -36,23 +46,61 @@ class LayerResult:
 
 
 @dataclass
+class ScoreError:
+    code: str
+    severity: str
+    message: str
+    deduction: float = 0.0
+
+
+@dataclass
 class RepScoreResult:
     rep_index: int
+
     layers: Dict[str, LayerResult] = field(default_factory=dict)
+
     technique_score: Optional[float] = None
     movement_quality: Optional[float] = None
     safety_score: Optional[float] = None
     performance_score: Optional[float] = None
+
     overall_score: Optional[float] = None
+    # 兼容旧前端
+    total_score: Optional[float] = None
+    grade: str = "N/A"
+
+    errors: List[ScoreError] = field(default_factory=list)
+    metrics: Dict[str, Optional[float]] = field(default_factory=dict)
+
+    data_quality_score: float = 100.0
+
     status: MetricStatus = MetricStatus.VALID
 
 
+# ═══════════════════════════════════════
+#  Weights
+# ═══════════════════════════════════════
+
 TECHNIQUE_WEIGHTS: Dict[str, float] = {
-    "bar_path": 0.25,
-    "elbow_tuck": 0.20,
-    "touch_point": 0.15,
-    "symmetry": 0.20,
+    "rom": 0.25,
     "tempo": 0.20,
+    "bottom_control": 0.20,
+    "lockout": 0.20,
+    "symmetry": 0.15,
+}
+
+MOVEMENT_WEIGHTS: Dict[str, float] = {
+    "direction_consistency": 0.50,
+    "velocity_smoothness": 0.50,
+}
+
+SAFETY_WEIGHTS: Dict[str, float] = {
+    "depth_control": 0.50,
+    "eccentric_control": 0.50,
+}
+
+PERFORMANCE_WEIGHTS: Dict[str, float] = {
+    "concentric_speed": 1.0,
 }
 
 LAYER_WEIGHTS: Dict[str, float] = {
@@ -64,108 +112,401 @@ LAYER_WEIGHTS: Dict[str, float] = {
 
 
 # ═══════════════════════════════════════
-#  指标计算函数
+#  Generic helpers
 # ═══════════════════════════════════════
 
-def compute_bar_path(rep: RepContext) -> MetricResult:
-    if not rep.has_concentric:
-        return MetricResult("bar_path", None, None,
-                            MetricStatus.INSUFFICIENT_DATA, "无 concentric 阶段")
-    if rep.bilateral_elbow is None:
-        return MetricResult("bar_path", None, None,
-                            MetricStatus.INSUFFICIENT_DATA, "无肘部数据")
-
-    cs = rep.concentric_start - rep.start_frame
-    ce = rep.concentric_end - rep.start_frame
-    ce = min(ce, len(rep.bilateral_elbow))
-
-    if ce - cs < 3:
-        return MetricResult("bar_path", None, None,
-                            MetricStatus.INSUFFICIENT_DATA, "concentric 帧数不足")
-
-    con_segment = rep.bilateral_elbow[cs: ce]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        std_val = float(np.nanstd(con_segment))
-    score = max(0.0, 100.0 - std_val * 5.0)
-    return MetricResult("bar_path", raw=std_val, score=score)
+def _clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float:
+    return float(max(lo, min(hi, v)))
 
 
-def compute_elbow_tuck(rep: RepContext) -> MetricResult:
-    bottom_phase = rep.get_phase("bottom")
-    if bottom_phase is None or rep.bilateral_elbow is None:
-        return MetricResult("elbow_tuck", None, None, MetricStatus.INSUFFICIENT_DATA)
+def _valid_weighted_average(
+    metrics: List[MetricResult],
+    weights: Dict[str, float],
+) -> LayerResult:
+    """只对 VALID 且有 score 的指标做加权平均，无效指标自动剔除。"""
+    valid = [
+        (m, weights.get(m.key, 0.0))
+        for m in metrics
+        if m.status == MetricStatus.VALID
+        and m.score is not None
+        and np.isfinite(m.score)
+    ]
 
-    bs = bottom_phase.start_frame - rep.start_frame
-    be = min(bottom_phase.end_frame - rep.start_frame, len(rep.bilateral_elbow))
-    if be - bs < 2:
-        return MetricResult("elbow_tuck", None, None, MetricStatus.INSUFFICIENT_DATA)
+    if not valid:
+        return LayerResult(
+            layer_name="unknown",
+            score=None,
+            status=MetricStatus.INSUFFICIENT_DATA,
+            metrics=metrics,
+            detail="没有有效指标",
+        )
 
-    seg = rep.bilateral_elbow[bs: be]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        min_angle = float(np.nanmin(seg))
-    ideal = 80.0
-    score = max(0.0, 100.0 - abs(min_angle - ideal) * 2.0)
-    return MetricResult("elbow_tuck", raw=min_angle, score=score)
+    total_weight = sum(w for _, w in valid)
+    if total_weight <= 0:
+        return LayerResult(
+            layer_name="unknown",
+            score=None,
+            status=MetricStatus.INSUFFICIENT_DATA,
+            metrics=metrics,
+        )
+
+    score = sum(
+        metric.score * (weight / total_weight)
+        for metric, weight in valid
+    )
+
+    return LayerResult(
+        layer_name="unknown",
+        score=round(score, 1),
+        status=MetricStatus.VALID,
+        metrics=metrics,
+        detail=f"{len(valid)}/{len(metrics)} 指标有效",
+    )
 
 
-def compute_touch_point(rep: RepContext) -> MetricResult:
-    bottom_phase = rep.get_phase("bottom")
-    if bottom_phase is None or rep.bilateral_elbow is None:
-        return MetricResult("touch_point", None, None, MetricStatus.INSUFFICIENT_DATA)
+# ═══════════════════════════════════════
+#  1. ROM — 连续评分，不再 abs(rom-80)
+# ═══════════════════════════════════════
 
-    bs = bottom_phase.start_frame - rep.start_frame
-    be = min(bottom_phase.end_frame - rep.start_frame, len(rep.bilateral_elbow))
-    if be - bs < 2:
-        return MetricResult("touch_point", None, None, MetricStatus.INSUFFICIENT_DATA)
+def compute_rom(rep: RepContext) -> MetricResult:
+    rom = float(rep.actual_rom)
 
-    seg = rep.bilateral_elbow[bs: be]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        std_val = float(np.nanstd(seg))
-    score = max(0.0, 100.0 - std_val * 8.0)
-    return MetricResult("touch_point", raw=std_val, score=score)
+    if not np.isfinite(rom) or rom <= 0:
+        return MetricResult("rom", None, None,
+                            MetricStatus.INSUFFICIENT_DATA, "ROM 无效")
+
+    # 卧推肘角 ROM：
+    #   70~100°  优秀（满分）
+    #   60~70°   偏低但可接受
+    #   100~110° 偏大但可接受
+    #   <60°     幅度不足，线性扣分
+    #   >110°    可能检测异常，轻度扣分
+    if 70.0 <= rom <= 100.0:
+        score = 100.0
+    elif 60.0 <= rom < 70.0:
+        score = 85.0 + (rom - 60.0) * 1.5   # 60→85, 70→100
+    elif 100.0 < rom <= 110.0:
+        score = 100.0 - (rom - 100.0) * 1.0  # 100→100, 110→90
+    elif rom < 60.0:
+        score = max(50.0, 85.0 - (60.0 - rom) * 2.0)
+    else:  # > 110
+        score = max(60.0, 90.0 - (rom - 110.0) * 1.5)
+
+    return MetricResult("rom", raw=rom, score=_clamp(score))
 
 
-def compute_symmetry(rep: RepContext) -> MetricResult:
-    if rep.left_elbow is None or rep.right_elbow is None:
-        return MetricResult("symmetry", None, None,
-                            MetricStatus.INSUFFICIENT_DATA, "缺少单侧数据")
-
-    cs = max(0, rep.concentric_start - rep.start_frame)
-    ce = min(len(rep.left_elbow), rep.concentric_end - rep.start_frame)
-    if ce - cs < 2:
-        return MetricResult("symmetry", None, None, MetricStatus.INSUFFICIENT_DATA)
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        lm = float(np.nanmean(rep.left_elbow[cs: ce]))
-        rm = float(np.nanmean(rep.right_elbow[cs: ce]))
-    if not np.isfinite(lm) or not np.isfinite(rm):
-        return MetricResult("symmetry", None, None,
-                            MetricStatus.INSUFFICIENT_DATA, "单侧数据全为 NaN")
-    asym = abs(lm - rm)
-    score = max(0.0, 100.0 - asym * 5.0)
-    return MetricResult("symmetry", raw=asym, score=score)
-
+# ═══════════════════════════════════════
+#  2. Tempo — ecc/con 比例
+# ═══════════════════════════════════════
 
 def compute_tempo(rep: RepContext) -> MetricResult:
-    if rep.eccentric_duration <= 0 or rep.concentric_duration <= 0:
-        return MetricResult("tempo", None, None, MetricStatus.INSUFFICIENT_DATA)
+    ecc = float(rep.eccentric_duration)
+    con = float(rep.concentric_duration)
 
-    ratio = rep.eccentric_duration / rep.concentric_duration
-    if 1.2 <= ratio <= 3.0:
+    if ecc <= 0 or con <= 0:
+        return MetricResult("tempo", None, None,
+                            MetricStatus.INSUFFICIENT_DATA, "阶段时长不足")
+
+    ratio = ecc / con
+
+    # 卧推常见目标：eccentric >= concentric
+    #   1.2~2.5  理想
+    #   1.0~1.2  偏快离心
+    #   0.75~1.0 离心明显偏短
+    #   2.5~3.0  离心偏长
+    #   其他     60 分基线
+    if 1.2 <= ratio <= 2.5:
         score = 100.0
-    elif ratio < 1.2:
-        score = max(0.0, 100.0 - (1.2 - ratio) * 40.0)
+    elif 1.0 <= ratio < 1.2:
+        score = 90.0
+    elif 0.75 <= ratio < 1.0:
+        score = 75.0
+    elif 2.5 < ratio <= 3.0:
+        score = 90.0
     else:
-        score = max(0.0, 100.0 - (ratio - 3.0) * 20.0)
+        score = 60.0
+
     return MetricResult("tempo", raw=ratio, score=score)
 
 
 # ═══════════════════════════════════════
-#  聚合
+#  3. Bottom Control — dwell time
+# ═══════════════════════════════════════
+
+def compute_bottom_control(rep: RepContext) -> MetricResult:
+    dwell = float(rep.bottom_dwell_time)
+
+    if not np.isfinite(dwell):
+        return MetricResult("bottom_control", None, None,
+                            MetricStatus.INSUFFICIENT_DATA)
+
+    # 0.05~0.35s 正常控制
+    # <0.05s 可能弹胸
+    # 0.35~0.50s 稍长停顿
+    # >0.50s 过长（可能失败/粘滞）
+    if 0.05 <= dwell <= 0.35:
+        score = 100.0
+    elif dwell < 0.05:
+        score = 85.0
+    elif dwell <= 0.50:
+        score = 90.0
+    else:
+        score = max(60.0, 90.0 - (dwell - 0.50) * 40.0)
+
+    return MetricResult("bottom_control", raw=dwell, score=_clamp(score))
+
+
+# ═══════════════════════════════════════
+#  4. Lockout — 顶端肘角
+# ═══════════════════════════════════════
+
+def compute_lockout(rep: RepContext) -> MetricResult:
+    top = float(rep.actual_max_angle)
+
+    if not np.isfinite(top) or top <= 0:
+        return MetricResult("lockout", None, None,
+                            MetricStatus.INSUFFICIENT_DATA)
+
+    # 卧推顶端不要求严格 180°，个体差异大
+    #   >=160  充分锁定
+    #   150~160 基本锁定
+    #   140~150 锁定不完全
+    #   130~140 明显未锁定
+    #   <130   严重未锁定
+    if top >= 160:
+        score = 100.0
+    elif top >= 150:
+        score = 92.0
+    elif top >= 140:
+        score = 80.0
+    elif top >= 130:
+        score = 65.0
+    else:
+        score = 50.0
+
+    return MetricResult("lockout", raw=top, score=score)
+
+
+# ═══════════════════════════════════════
+#  5. Symmetry — 双侧数据门槛
+# ═══════════════════════════════════════
+
+def compute_symmetry(rep: RepContext) -> MetricResult:
+    # 非双侧数据，绝对不能判定不对称
+    if rep.left_elbow is None or rep.right_elbow is None:
+        return MetricResult("symmetry", None, None,
+                            MetricStatus.INSUFFICIENT_DATA, "缺少双侧数据")
+
+    # 关键：bilateral_valid_ratio 不足时直接 N/A
+    bilateral = float(getattr(rep, "bilateral_valid_ratio", 0.0))
+    if bilateral < 0.65:
+        return MetricResult(
+            "symmetry", None, None,
+            MetricStatus.INSUFFICIENT_DATA,
+            f"双侧有效比例不足: {bilateral:.2f} (<0.65)",
+        )
+
+    left = np.asarray(rep.left_elbow, dtype=float)
+    right = np.asarray(rep.right_elbow, dtype=float)
+
+    cs = max(0, rep.concentric_start - rep.start_frame)
+    ce = min(len(left), rep.concentric_end - rep.start_frame)
+    if ce - cs < 5:
+        return MetricResult("symmetry", None, None,
+                            MetricStatus.INSUFFICIENT_DATA, "concentric 帧数不足")
+
+    seg_l = left[cs:ce]
+    seg_r = right[cs:ce]
+    valid = np.isfinite(seg_l) & np.isfinite(seg_r)
+
+    if valid.sum() < 5:
+        return MetricResult("symmetry", None, None,
+                            MetricStatus.INSUFFICIENT_DATA, "有效帧不足")
+
+    diff = np.abs(seg_l[valid] - seg_r[valid])
+    asym = float(np.nanmedian(diff))
+
+    # <=3° 优秀，<=5° 良好，<=8° 可接受，<=12° 轻度不对称
+    if asym <= 3:
+        score = 100.0
+    elif asym <= 5:
+        score = 95.0
+    elif asym <= 8:
+        score = 85.0
+    elif asym <= 12:
+        score = 70.0
+    else:
+        score = max(40.0, 70.0 - (asym - 12.0) * 3.0)
+
+    return MetricResult("symmetry", raw=asym, score=_clamp(score))
+
+
+# ═══════════════════════════════════════
+#  6. Direction Consistency
+# ═══════════════════════════════════════
+
+def compute_direction_consistency(rep: RepContext) -> MetricResult:
+    if rep.eccentric_velocity is None or rep.concentric_velocity is None:
+        return MetricResult("direction_consistency", None, None,
+                            MetricStatus.INSUFFICIENT_DATA)
+
+    ecc = np.asarray(rep.eccentric_velocity, dtype=float)
+    con = np.asarray(rep.concentric_velocity, dtype=float)
+    ecc = ecc[np.isfinite(ecc)]
+    con = con[np.isfinite(con)]
+
+    if len(ecc) < 5 or len(con) < 5:
+        return MetricResult("direction_consistency", None, None,
+                            MetricStatus.INSUFFICIENT_DATA)
+
+    # eccentric 应主要为负（角度减小），concentric 应主要为正（角度增大）
+    # 用 ±5°/s 容差带
+    ecc_correct = float(np.mean(ecc <= 5.0))
+    con_correct = float(np.mean(con >= -5.0))
+    quality = 0.5 * ecc_correct + 0.5 * con_correct
+
+    return MetricResult("direction_consistency", raw=quality,
+                        score=_clamp(quality * 100.0))
+
+
+# ═══════════════════════════════════════
+#  7. Velocity Smoothness — MAD 替代 std
+# ═══════════════════════════════════════
+
+def compute_velocity_smoothness(rep: RepContext) -> MetricResult:
+    if rep.concentric_velocity is None:
+        return MetricResult("velocity_smoothness", None, None,
+                            MetricStatus.INSUFFICIENT_DATA)
+
+    v = np.asarray(rep.concentric_velocity, dtype=float)
+    v = v[np.isfinite(v)]
+
+    if len(v) < 6:
+        return MetricResult("velocity_smoothness", None, None,
+                            MetricStatus.INSUFFICIENT_DATA)
+
+    dv = np.diff(v)
+    # robust MAD，抗异常帧
+    med = np.median(dv)
+    mad = float(np.median(np.abs(dv - med)))
+
+    if mad <= 3:
+        score = 100.0
+    elif mad <= 6:
+        score = 95.0
+    elif mad <= 10:
+        score = 85.0
+    elif mad <= 15:
+        score = 75.0
+    elif mad <= 25:
+        score = 60.0
+    else:
+        score = max(30.0, 60.0 - (mad - 25.0) * 1.5)
+
+    return MetricResult("velocity_smoothness", raw=mad, score=_clamp(score))
+
+
+# ═══════════════════════════════════════
+#  8. Depth Control — 修复 joint_stress 不连续
+# ═══════════════════════════════════════
+
+def compute_depth_control(rep: RepContext) -> MetricResult:
+    bottom = float(rep.actual_min_angle)
+
+    if not np.isfinite(bottom) or bottom <= 0:
+        return MetricResult("depth_control", None, None,
+                            MetricStatus.INSUFFICIENT_DATA)
+
+    # 只评价底部深度是否进入极端区间，不声称是"医学关节压力"
+    #   >=75  安全深度
+    #   65~75 可接受
+    #   55~65 偏深
+    #   45~55 较深
+    #   <45   过深
+    if bottom >= 75:
+        score = 100.0
+    elif bottom >= 65:
+        score = 95.0
+    elif bottom >= 55:
+        score = 85.0
+    elif bottom >= 45:
+        score = 70.0
+    else:
+        score = 55.0
+
+    return MetricResult("depth_control", raw=bottom, score=score)
+
+
+# ═══════════════════════════════════════
+#  9. Eccentric Control
+# ═══════════════════════════════════════
+
+def compute_eccentric_control(rep: RepContext) -> MetricResult:
+    if rep.eccentric_velocity is None:
+        return MetricResult("eccentric_control", None, None,
+                            MetricStatus.INSUFFICIENT_DATA)
+
+    v = np.asarray(rep.eccentric_velocity, dtype=float)
+    v = v[np.isfinite(v)]
+
+    if len(v) < 5:
+        return MetricResult("eccentric_control", None, None,
+                            MetricStatus.INSUFFICIENT_DATA)
+
+    peak = abs(float(np.nanmin(v)))
+
+    # 不把高速度直接等价为危险
+    if peak <= 120:
+        score = 100.0
+    elif peak <= 180:
+        score = 95.0
+    elif peak <= 240:
+        score = 90.0
+    elif peak <= 320:
+        score = 80.0
+    else:
+        score = max(55.0, 80.0 - (peak - 320.0) * 0.10)
+
+    return MetricResult("eccentric_control", raw=peak, score=_clamp(score))
+
+
+# ═══════════════════════════════════════
+#  10. Concentric Speed（原 power，语义修正）
+# ═══════════════════════════════════════
+
+def compute_concentric_speed(rep: RepContext) -> MetricResult:
+    if rep.concentric_velocity is None:
+        return MetricResult("concentric_speed", None, None,
+                            MetricStatus.INSUFFICIENT_DATA)
+
+    v = np.asarray(rep.concentric_velocity, dtype=float)
+    v = v[np.isfinite(v)]
+
+    if len(v) < 5:
+        return MetricResult("concentric_speed", None, None,
+                            MetricStatus.INSUFFICIENT_DATA)
+
+    peak = float(np.nanmax(v))
+
+    # 只是角速度表现，不叫 power
+    if peak >= 250:
+        score = 100.0
+    elif peak >= 200:
+        score = 95.0
+    elif peak >= 150:
+        score = 85.0
+    elif peak >= 100:
+        score = 75.0
+    elif peak >= 50:
+        score = 60.0
+    else:
+        score = 45.0
+
+    return MetricResult("concentric_speed", raw=peak, score=score)
+
+
+# ═══════════════════════════════════════
+#  Layer aggregator
 # ═══════════════════════════════════════
 
 def aggregate_layer(
@@ -173,192 +514,274 @@ def aggregate_layer(
     metrics: List[MetricResult],
     weights: Dict[str, float],
 ) -> LayerResult:
-    valid = [(m, weights.get(m.key, 0.0))
-             for m in metrics
-             if m.status == MetricStatus.VALID and m.score is not None]
-
-    if not valid:
-        return LayerResult(layer_name, None, MetricStatus.INSUFFICIENT_DATA,
-                           metrics, "所有指标数据不足")
-
-    tw = sum(w for _, w in valid)
-    if tw <= 0:
-        return LayerResult(layer_name, None, MetricStatus.INSUFFICIENT_DATA, metrics)
-
-    weighted = sum(m.score * (w / tw) for m, w in valid)
-    return LayerResult(layer_name, round(weighted, 1), MetricStatus.VALID,
-                       metrics, f"{len(valid)}/{len(metrics)} 指标有效")
+    result = _valid_weighted_average(metrics, weights)
+    result.layer_name = layer_name
+    return result
 
 
 # ═══════════════════════════════════════
-#  主 Scorer
+#  Main Scorer
 # ═══════════════════════════════════════
 
 class ExerciseSpecificScorerV2:
 
     def score_rep(self, rep: RepContext) -> RepScoreResult:
-        r = RepScoreResult(rep_index=rep.rep_index)
+        result = RepScoreResult(rep_index=rep.rep_index)
 
         if rep.validation_status != ValidationStatus.VALID:
-            r.status = MetricStatus.INSUFFICIENT_DATA
-            r.overall_score = None
-            return r
+            result.status = MetricStatus.INSUFFICIENT_DATA
+            return result
 
-        tech = [compute_bar_path(rep), compute_elbow_tuck(rep),
-                compute_touch_point(rep), compute_symmetry(rep), compute_tempo(rep)]
-        tl = aggregate_layer("technique", tech, TECHNIQUE_WEIGHTS)
-        r.layers["technique"] = tl
-        r.technique_score = tl.score
-
-        mq = self._mq_metrics(rep)
-        ml = aggregate_layer("movement_quality", mq, {"rom_consistency": .5, "velocity_smoothness": .5})
-        r.layers["movement_quality"] = ml
-        r.movement_quality = ml.score
-
-        sf = self._safety_metrics(rep)
-        sl = aggregate_layer("safety", sf, {"joint_stress": .5, "control": .5})
-        r.layers["safety"] = sl
-        r.safety_score = sl.score
-
-        pf = self._perf_metrics(rep)
-        pl = aggregate_layer("performance", pf, {"power": .5, "rom": .5})
-        r.layers["performance"] = pl
-        r.performance_score = pl.score
-
-        vl = [(n, w) for n, w in LAYER_WEIGHTS.items() if r.layers[n].score is not None]
-        if vl:
-            tw = sum(w for _, w in vl)
-            r.overall_score = round(sum(r.layers[n].score * (w / tw) for n, w in vl) / 10.0, 1)
-        else:
-            r.overall_score = None
-            r.status = MetricStatus.INSUFFICIENT_DATA
-
-        return r
-
-    def _mq_metrics(self, rep: RepContext) -> List[MetricResult]:
-        ms = []
-        if rep.actual_rom > 0:
-            dev = abs(rep.actual_rom - 80.0)
-            ms.append(MetricResult("rom_consistency", rep.actual_rom, max(0, 100 - dev * 1.5)))
-        else:
-            ms.append(MetricResult("rom_consistency", None, None, MetricStatus.INSUFFICIENT_DATA))
-
-        if rep.concentric_velocity is not None and len(rep.concentric_velocity) > 3:
-            jerk_std = float(np.std(np.diff(rep.concentric_velocity)))
-            ms.append(MetricResult("velocity_smoothness", jerk_std, max(0, 100 - jerk_std * 2)))
-        else:
-            ms.append(MetricResult("velocity_smoothness", None, None, MetricStatus.INSUFFICIENT_DATA))
-        return ms
-
-    def _safety_metrics(self, rep: RepContext) -> List[MetricResult]:
-        ms = []
-        if rep.bottom_angle > 0:
-            s = max(0, 100 - max(0, 50 - rep.bottom_angle) * 3) if rep.bottom_angle < 50 else 100.0
-            ms.append(MetricResult("joint_stress", rep.bottom_angle, s))
-        else:
-            ms.append(MetricResult("joint_stress", None, None, MetricStatus.INSUFFICIENT_DATA))
-
-        if rep.peak_eccentric_velocity is not None:
-            s = max(0, 100 - max(0, rep.peak_eccentric_velocity - 300) * 0.5)
-            ms.append(MetricResult("control", rep.peak_eccentric_velocity, s))
-        else:
-            ms.append(MetricResult("control", None, None, MetricStatus.INSUFFICIENT_DATA))
-        return ms
-
-    def _perf_metrics(self, rep: RepContext) -> List[MetricResult]:
-        ms = []
-        if rep.peak_concentric_velocity is not None:
-            ms.append(MetricResult("power", rep.peak_concentric_velocity,
-                                   min(100, rep.peak_concentric_velocity / 2.0)))
-        else:
-            ms.append(MetricResult("power", None, None, MetricStatus.INSUFFICIENT_DATA))
-
-        if rep.actual_rom > 0:
-            ms.append(MetricResult("rom", rep.actual_rom, min(100, rep.actual_rom)))
-        else:
-            ms.append(MetricResult("rom", None, None, MetricStatus.INSUFFICIENT_DATA))
-        return ms
-    
-    def format_v2_results_for_frontend(
-        rep_scores: list,
-        set_errors: list,
-        fatigue_result=None,
-        exercise_type: str = "unknown",
-    ) -> dict:
-        """
-        将 V2 引擎原始输出转为前端可直接消费的 JSON 结构。
-        """
-        # 1. Rep 级别
-        reps_out = []
-        for rs in rep_scores:
-            reps_out.append({
-                "rep_index": rs.rep_index,
-                "score": rs.total_score,
-                "grade": rs.grade,
-                "errors": [
-                    {
-                        "code": e.code,
-                        "severity": e.severity,
-                        "message": e.message,
-                        "deduction": e.deduction,
-                    }
-                    for e in (rs.errors or [])
-                ],
-                "metrics": {
-                    "rom": rs.metrics.get("rom"),
-                    "tempo_ratio": rs.metrics.get("tempo_ratio"),
-                    "peak_concentric_velocity": rs.metrics.get("peak_concentric_velocity"),
-                    "bottom_dwell_time": rs.metrics.get("bottom_dwell_time"),
-                },
-            })
-
-        # 2. Set 级别错误
-        set_errors_out = [
-            {
-                "code": e.code,
-                "severity": e.severity,
-                "message": e.message,
-            }
-            for e in (set_errors or [])
+        # ── Technique ──
+        technique_metrics = [
+            compute_rom(rep),
+            compute_tempo(rep),
+            compute_bottom_control(rep),
+            compute_lockout(rep),
+            compute_symmetry(rep),
         ]
+        technique = aggregate_layer("technique", technique_metrics, TECHNIQUE_WEIGHTS)
+        result.layers["technique"] = technique
+        result.technique_score = technique.score
 
-        # 3. 疲劳
-        fatigue_out = None
-        if fatigue_result and getattr(fatigue_result, "status", "") == "valid":
-            fatigue_out = {
-                "velocity_loss_pct": fatigue_result.velocity_loss_pct,
-                "fatigue_level": fatigue_result.fatigue_level,
-                "estimated_rir": fatigue_result.estimated_rir,
-                "trend": fatigue_result.trend,
-            }
+        # ── Movement Quality ──
+        movement_metrics = [
+            compute_direction_consistency(rep),
+            compute_velocity_smoothness(rep),
+        ]
+        movement = aggregate_layer("movement_quality", movement_metrics, MOVEMENT_WEIGHTS)
+        result.layers["movement_quality"] = movement
+        result.movement_quality = movement.score
 
-        # 4. 汇总
-        valid_scores = [r["score"] for r in reps_out if r["score"] is not None]
-        avg_score = round(sum(valid_scores) / len(valid_scores), 1) if valid_scores else 0.0
+        # ── Safety / Control ──
+        safety_metrics = [
+            compute_depth_control(rep),
+            compute_eccentric_control(rep),
+        ]
+        safety = aggregate_layer("safety", safety_metrics, SAFETY_WEIGHTS)
+        result.layers["safety"] = safety
+        result.safety_score = safety.score
 
-        return {
-            "exercise_type": exercise_type,
-            "total_reps": len(reps_out),
-            "average_score": avg_score,
-            "reps": reps_out,
-            "set_errors": set_errors_out,
-            "fatigue": fatigue_out,
+        # ── Performance ──
+        perf_metrics = [
+            compute_concentric_speed(rep),
+        ]
+        performance = aggregate_layer("performance", perf_metrics, PERFORMANCE_WEIGHTS)
+        result.layers["performance"] = performance
+        result.performance_score = performance.score
+
+        # ── Overall（只对有效层加权，0~100 → 0~10）──
+        valid_layers = []
+        for name, weight in LAYER_WEIGHTS.items():
+            layer = result.layers.get(name)
+            if (layer is not None and layer.score is not None
+                    and np.isfinite(layer.score)):
+                valid_layers.append((layer.score, weight))
+
+        if not valid_layers:
+            result.overall_score = None
+            result.total_score = None
+            result.status = MetricStatus.INSUFFICIENT_DATA
+            return result
+
+        total_weight = sum(w for _, w in valid_layers)
+        score_100 = sum(s * (w / total_weight) for s, w in valid_layers)
+        score_10 = round(score_100 / 10.0, 1)
+
+        result.overall_score = score_10
+        result.total_score = score_10
+
+        # ── Data Quality（独立，不扣动作分）──
+        result.data_quality_score = self._compute_data_quality(rep)
+
+        # ── Metrics for frontend ──
+        result.metrics = {
+            "rom": float(rep.actual_rom) if np.isfinite(rep.actual_rom) else None,
+            "tempo_ratio": (
+                rep.eccentric_duration / rep.concentric_duration
+                if rep.concentric_duration > 0 else None
+            ),
+            "peak_concentric_velocity": (
+                float(rep.peak_concentric_velocity)
+                if rep.peak_concentric_velocity is not None
+                and np.isfinite(rep.peak_concentric_velocity) else None
+            ),
+            "bottom_dwell_time": (
+                float(rep.bottom_dwell_time)
+                if np.isfinite(rep.bottom_dwell_time) else None
+            ),
         }
 
-def format_v2_results_for_frontend(rep_scores, set_errors, fatigue_result=None, exercise_type='unknown'):
+        # ── Errors（只做解释，不直接扣分）──
+        result.errors = self._detect_errors(rep)
+
+        # ── Grade ──
+        result.grade = self._grade(score_10)
+
+        return result
+
+    # ═══════════════════════════════════════
+    #  Data quality
+    # ═══════════════════════════════════════
+
+    @staticmethod
+    def _compute_data_quality(rep: RepContext) -> float:
+        score = 100.0
+
+        bilateral = float(getattr(rep, "bilateral_valid_ratio", 1.0))
+        if bilateral < 0.20:
+            score -= 20
+        elif bilateral < 0.50:
+            score -= 10
+        elif bilateral < 0.65:
+            score -= 5
+
+        if rep.eccentric_velocity is None:
+            score -= 10
+        if rep.concentric_velocity is None:
+            score -= 10
+
+        return _clamp(score)
+
+    # ═══════════════════════════════════════
+    #  Error detection（解释层，不直接扣分）
+    # ═══════════════════════════════════════
+
+    @staticmethod
+    def _detect_errors(rep: RepContext) -> List[ScoreError]:
+        errors: List[ScoreError] = []
+
+        # ROM 不足
+        if rep.actual_rom > 0 and rep.actual_rom < 60:
+            errors.append(ScoreError(
+                code="INSUFFICIENT_ROM",
+                severity="moderate",
+                message="动作幅度偏小",
+            ))
+
+        # Tempo 失衡
+        if rep.concentric_duration > 0:
+            ratio = rep.eccentric_duration / rep.concentric_duration
+            if ratio < 0.75:
+                errors.append(ScoreError(
+                    code="TEMPO_UNBALANCED",
+                    severity="minor",
+                    message="离心阶段明显短于向心阶段",
+                ))
+
+        # Symmetry：只有数据充足时才检测
+        bilateral = float(getattr(rep, "bilateral_valid_ratio", 0.0))
+        if bilateral >= 0.65 and rep.left_elbow is not None and rep.right_elbow is not None:
+            left = np.asarray(rep.left_elbow, dtype=float)
+            right = np.asarray(rep.right_elbow, dtype=float)
+            cs = max(0, rep.concentric_start - rep.start_frame)
+            ce = min(len(left), rep.concentric_end - rep.start_frame)
+            if ce - cs >= 5:
+                seg_l, seg_r = left[cs:ce], right[cs:ce]
+                valid = np.isfinite(seg_l) & np.isfinite(seg_r)
+                if valid.sum() >= 5:
+                    asym = float(np.nanmedian(np.abs(seg_l[valid] - seg_r[valid])))
+                    if asym > 10:
+                        errors.append(ScoreError(
+                            code="ASYMMETRY",
+                            severity="moderate",
+                            message="左右侧动作存在明显差异",
+                        ))
+
+        return errors
+
+    # ═══════════════════════════════════════
+    #  Grade
+    # ═══════════════════════════════════════
+
+    @staticmethod
+    def _grade(score: float) -> str:
+        if score >= 9.0:
+            return "A"
+        if score >= 8.0:
+            return "B"
+        if score >= 7.0:
+            return "C"
+        if score >= 6.0:
+            return "D"
+        return "E"
+
+
+# ═══════════════════════════════════════
+#  Frontend formatter
+# ═══════════════════════════════════════
+
+def format_v2_results_for_frontend(
+    rep_scores: list,
+    set_errors: list = None,
+    fatigue_result=None,
+    exercise_type: str = "unknown",
+) -> dict:
+    """将 V2 引擎原始输出转为前端可直接消费的 JSON 结构。"""
     reps_out = []
     for rs in rep_scores:
         reps_out.append({
-            'rep_index': rs.rep_index,
-            'score': rs.total_score,
-            'grade': rs.grade,
-            'errors': [{'code': e.code, 'severity': e.severity, 'message': e.message, 'deduction': e.deduction} for e in (rs.errors or [])],
-            'metrics': {k: rs.metrics.get(k) for k in ['rom','tempo_ratio','peak_concentric_velocity','bottom_dwell_time']},
+            "rep_index": rs.rep_index,
+            "score": rs.total_score,
+            "grade": rs.grade,
+            "data_quality": getattr(rs, "data_quality_score", 100.0),
+            "errors": [
+                {
+                    "code": e.code,
+                    "severity": e.severity,
+                    "message": e.message,
+                    "deduction": e.deduction,
+                }
+                for e in (rs.errors or [])
+            ],
+            "metrics": {
+                "rom": rs.metrics.get("rom"),
+                "tempo_ratio": rs.metrics.get("tempo_ratio"),
+                "peak_concentric_velocity": rs.metrics.get("peak_concentric_velocity"),
+                "bottom_dwell_time": rs.metrics.get("bottom_dwell_time"),
+            },
+            "layers": {
+                ln: {
+                    "score": lr.score,
+                    "status": lr.status.value,
+                    "metrics": [
+                        {"key": m.key, "raw": m.raw, "score": m.score,
+                         "status": m.status.value, "detail": m.detail}
+                        for m in lr.metrics
+                    ],
+                }
+                for ln, lr in (rs.layers or {}).items()
+            },
         })
-    set_errors_out = [{'code': e.code, 'severity': e.severity, 'message': e.message} for e in (set_errors or [])]
+
+    set_errors_out = [
+        {
+            "code": e.error_id if hasattr(e, "error_id") else e.get("code"),
+            "severity": (e.worst_severity.value if hasattr(e, "worst_severity") and e.worst_severity
+                         else e.get("severity", "moderate")),
+            "message": (e.display_name if hasattr(e, "display_name")
+                        else e.get("message", "")),
+        }
+        for e in (set_errors or [])
+    ]
+
     fatigue_out = None
-    if fatigue_result and getattr(fatigue_result, 'status', '') == 'valid':
-        fatigue_out = {'velocity_loss_pct': fatigue_result.velocity_loss_pct, 'fatigue_level': fatigue_result.fatigue_level, 'estimated_rir': fatigue_result.estimated_rir, 'trend': fatigue_result.trend}
-    valid_scores = [r['score'] for r in reps_out if r['score'] is not None]
-    avg_score = round(sum(valid_scores)/len(valid_scores),1) if valid_scores else 0.0
-    return {'exercise_type': exercise_type, 'total_reps': len(reps_out), 'average_score': avg_score, 'reps': reps_out, 'set_errors': set_errors_out, 'fatigue': fatigue_out}
+    if fatigue_result and getattr(fatigue_result, "status", "") == "valid":
+        fatigue_out = {
+            "velocity_loss_pct": fatigue_result.velocity_loss_pct,
+            "fatigue_level": fatigue_result.fatigue_level,
+            "estimated_rir": fatigue_result.estimated_rir,
+            "trend": fatigue_result.trend,
+        }
+
+    valid_scores = [r["score"] for r in reps_out if r["score"] is not None]
+    avg_score = round(sum(valid_scores) / len(valid_scores), 1) if valid_scores else 0.0
+
+    return {
+        "exercise_type": exercise_type,
+        "total_reps": len(reps_out),
+        "average_score": avg_score,
+        "reps": reps_out,
+        "set_errors": set_errors_out,
+        "fatigue": fatigue_out,
+    }

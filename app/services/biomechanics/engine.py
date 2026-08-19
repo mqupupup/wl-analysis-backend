@@ -232,6 +232,10 @@ class BiomechanicsEngine:
         avg_score = round(float(np.mean([s.overall_score for s in rep_scores
                                          if s.overall_score is not None])), 1) if rep_scores else 0.0
 
+        avg_data_quality = round(float(np.mean([
+            getattr(s, "data_quality_score", 100.0) for s in rep_scores
+        ])), 1) if rep_scores else 100.0
+
         error_summary = self._summarize_v2_errors(set_errors, valid_contexts)
         feedback = self._generate_v2_feedback(rep_scores, set_errors, exercise)
         skeleton_frames = self._build_skeleton_frames(frame_data_list, target_count=8)
@@ -268,11 +272,15 @@ class BiomechanicsEngine:
                     "quality_score": next(
                         (s.overall_score for s in rep_scores if s.rep_index == ctx.rep_index), None
                     ),
+                    "data_quality": next(
+                        (getattr(s, "data_quality_score", 100.0) for s in rep_scores if s.rep_index == ctx.rep_index), 100.0
+                    ),
                     "feedback": "",
                 } for ctx in contexts
             ],
             "quality": {
                 "total_score": avg_score,
+                "data_quality": avg_data_quality,
                 "breakdown": self._summarize_v2_layers(rep_scores),
                 "feedback": feedback,
             },
@@ -453,11 +461,11 @@ class BiomechanicsEngine:
         zh = EXERCISE_ZH_MAP.get(exercise, exercise)
         cnt = len(rep_scores)
 
-        if avg >= 90:
+        if avg >= 9.0:
             feedback.append(f"🏆 {zh}技术非常出色！{cnt}次动作质量稳定。")
-        elif avg >= 75:
+        elif avg >= 7.5:
             feedback.append(f"👍 {zh}整体不错，有改进空间。")
-        elif avg >= 60:
+        elif avg >= 6.0:
             feedback.append(f"🔧 {zh}需要针对性改进。")
         else:
             feedback.append(f"⛔ {zh}存在安全隐患，建议降低重量。")
@@ -480,6 +488,8 @@ class BiomechanicsEngine:
                 "overall_score": s.overall_score,
                 "technique_score": s.technique_score,
                 "status": s.status.value,
+                "data_quality": getattr(s, "data_quality_score", 100.0),
+                "grade": getattr(s, "grade", "N/A"),
                 "layers": {},
             }
             for ln, lr in s.layers.items():
@@ -487,7 +497,8 @@ class BiomechanicsEngine:
                     "score": lr.score,
                     "status": lr.status.value,
                     "metrics": [
-                        {"key": m.key, "raw": m.raw, "score": m.score, "status": m.status.value}
+                        {"key": m.key, "raw": m.raw, "score": m.score,
+                         "status": m.status.value, "detail": getattr(m, "detail", "")}
                         for m in lr.metrics
                     ],
                 }
@@ -495,6 +506,8 @@ class BiomechanicsEngine:
                 rep_dict["actual_rom"] = round(ctx.actual_rom, 1)
                 rep_dict["duration"] = round(ctx.total_duration, 2)
                 rep_dict["validation_status"] = ctx.validation_status.value
+                rep_dict["bilateral_valid_ratio"] = round(ctx.bilateral_valid_ratio, 3)
+                rep_dict["signal_source"] = ctx.signal_source.value if hasattr(ctx.signal_source, "value") else str(ctx.signal_source)
             results.append(rep_dict)
         return results
 

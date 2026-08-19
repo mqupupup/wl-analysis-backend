@@ -163,15 +163,15 @@ class BiomechanicsService:
             weak_dimensions.sort(key=lambda x: x["avg_score"])
         
         # ========== 3. 生成总体评价 ==========
-        if total_score >= 85:
+        if total_score >= 8.5:
             overall = "优秀"
             overall_emoji = "🏆"
             overall_desc = f"你的{exercise_zh}动作非常标准，继续保持！"
-        elif total_score >= 70:
+        elif total_score >= 7.0:
             overall = "良好"
             overall_emoji = "✅"
             overall_desc = f"你的{exercise_zh}整体不错，但有一些细节可以优化。"
-        elif total_score >= 50:
+        elif total_score >= 5.0:
             overall = "一般"
             overall_emoji = "⚠️"
             overall_desc = f"你的{exercise_zh}存在几个明显的问题，建议针对性改进。"
