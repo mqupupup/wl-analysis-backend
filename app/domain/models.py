@@ -88,6 +88,14 @@ class RepContext:
     left_upper_arm_torso: Optional[np.ndarray] = None
     right_upper_arm_torso: Optional[np.ndarray] = None
 
+    # ── Rep-relative 髋/肩/膝坐标（形状 (N, 2)，用于 butt-off-bench 检测）──
+    left_hip: Optional[np.ndarray] = None
+    right_hip: Optional[np.ndarray] = None
+    left_shoulder: Optional[np.ndarray] = None
+    right_shoulder: Optional[np.ndarray] = None
+    left_knee: Optional[np.ndarray] = None
+    right_knee: Optional[np.ndarray] = None
+
     # ── 阶段列表 ──
     phases: List[PhaseSegment] = field(default_factory=list)
 

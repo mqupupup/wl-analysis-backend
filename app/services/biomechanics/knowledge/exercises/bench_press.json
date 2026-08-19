@@ -411,9 +411,23 @@
                 "臀部离凳会改变力传递路径，可能增加下背应变"
             ],
             "detect": {
-                "method": "butt_contact_lost",
-                "condition": "hip_y significantly above bench plane AND buttocks contact lost",
-                "at_phase": "concentric"
+                "method": "pose_relative_pelvis_lift",
+                "signals": [
+                    "pelvis_center_y",
+                    "shoulder_center_y",
+                    "setup_baseline",
+                    "relative_lift = Δpelvis_y - 0.5 * Δshoulder_y",
+                    "persistence_frames"
+                ],
+                "condition": "relative_lift > max(15px, 0.05 * torso_length) AND persistence >= 0.15s",
+                "at_phase": "concentric",
+                "states": [
+                    "normal_arch",
+                    "suspected_lift",
+                    "confirmed_lift",
+                    "insufficient_data"
+                ],
+                "limitation": "V1 仅用 Pose，无法检测 bench plane。主要输出 suspected_lift，confirmed_lift 需 V2（bench plane detection）。"
             },
             "severity_levels": {
                 "minor": {

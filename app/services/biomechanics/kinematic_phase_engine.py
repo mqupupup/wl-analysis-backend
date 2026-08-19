@@ -1135,6 +1135,12 @@ class PhaseBuilder:
         right_wrist: Optional[np.ndarray] = None,
         left_upper_arm_torso: Optional[np.ndarray] = None,
         right_upper_arm_torso: Optional[np.ndarray] = None,
+        left_hip: Optional[np.ndarray] = None,
+        right_hip: Optional[np.ndarray] = None,
+        left_shoulder: Optional[np.ndarray] = None,
+        right_shoulder: Optional[np.ndarray] = None,
+        left_knee: Optional[np.ndarray] = None,
+        right_knee: Optional[np.ndarray] = None,
     ) -> RepContext:
         n = len(angles)
         sf = max(0, min(start_frame, n - 1))
@@ -1230,6 +1236,24 @@ class PhaseBuilder:
         if right_upper_arm_torso is not None and sf < len(right_upper_arm_torso):
             right_uat_slice = right_upper_arm_torso[sf:ef + 1].copy()
 
+        # 髋/肩/膝坐标切片（形状 (N, 2)，用于 butt-off-bench 检测）
+        left_hip_slice = right_hip_slice = None
+        left_shoulder_slice = right_shoulder_slice = None
+        left_knee_slice = right_knee_slice = None
+
+        if left_hip is not None and sf < len(left_hip):
+            left_hip_slice = left_hip[sf:ef + 1].copy()
+        if right_hip is not None and sf < len(right_hip):
+            right_hip_slice = right_hip[sf:ef + 1].copy()
+        if left_shoulder is not None and sf < len(left_shoulder):
+            left_shoulder_slice = left_shoulder[sf:ef + 1].copy()
+        if right_shoulder is not None and sf < len(right_shoulder):
+            right_shoulder_slice = right_shoulder[sf:ef + 1].copy()
+        if left_knee is not None and sf < len(left_knee):
+            left_knee_slice = left_knee[sf:ef + 1].copy()
+        if right_knee is not None and sf < len(right_knee):
+            right_knee_slice = right_knee[sf:ef + 1].copy()
+
         if le_slice is not None and right_elbow_slice is not None:
             le_valid = np.isfinite(le_slice)
             re_valid = np.isfinite(right_elbow_slice)
@@ -1310,4 +1334,10 @@ class PhaseBuilder:
             left_wrist=left_wrist_slice, right_wrist=right_wrist_slice,
             left_upper_arm_torso=left_uat_slice,
             right_upper_arm_torso=right_uat_slice,
+            left_hip=left_hip_slice,
+            right_hip=right_hip_slice,
+            left_shoulder=left_shoulder_slice,
+            right_shoulder=right_shoulder_slice,
+            left_knee=left_knee_slice,
+            right_knee=right_knee_slice,
         )

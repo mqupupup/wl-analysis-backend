@@ -142,6 +142,10 @@ class BiomechanicsEngine:
         left_wrist_arr, right_wrist_arr = self._extract_side_wrist_arrays(frame_data_list)
         # 提取 upper_arm_torso 角度供 elbow tuck 检测使用
         left_uat_arr, right_uat_arr = self._extract_side_upper_arm_torso_arrays(frame_data_list)
+        # 提取髋/肩/膝坐标供 butt-off-bench 检测使用
+        left_hip_arr, right_hip_arr = self._extract_side_joint_position_arrays(frame_data_list, "hip")
+        left_shoulder_arr, right_shoulder_arr = self._extract_side_joint_position_arrays(frame_data_list, "shoulder")
+        left_knee_arr, right_knee_arr = self._extract_side_joint_position_arrays(frame_data_list, "knee")
 
         # ── V7 修改点 3: 修复 both_valid 未定义的 Bug ──
         n_frames = len(frame_data_list)
@@ -187,6 +191,12 @@ class BiomechanicsEngine:
                 right_wrist=right_wrist_arr,
                 left_upper_arm_torso=left_uat_arr,
                 right_upper_arm_torso=right_uat_arr,
+                left_hip=left_hip_arr,
+                right_hip=right_hip_arr,
+                left_shoulder=left_shoulder_arr,
+                right_shoulder=right_shoulder_arr,
+                left_knee=left_knee_arr,
+                right_knee=right_knee_arr,
             )
             contexts.append(ctx)
 
@@ -465,6 +475,63 @@ class BiomechanicsEngine:
 
         l_valid = int(np.sum(np.isfinite(left)))
         r_valid = int(np.sum(np.isfinite(right)))
+
+        left_out = left if l_valid > 0 else None
+        right_out = right if r_valid > 0 else None
+        return left_out, right_out
+
+    def _extract_side_joint_position_arrays(
+        self, frame_data_list: List[FramePoseData], joint: str
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        从 FramePoseData 提取左右侧某关节的坐标数组（形状 N×2）。
+
+        Args:
+            joint: "hip" / "shoulder" / "knee" / "ankle" / "elbow" / "wrist"
+        """
+        n = len(frame_data_list)
+        left = np.full((n, 2), np.nan, dtype=np.float64)
+        right = np.full((n, 2), np.nan, dtype=np.float64)
+
+        ALIASES = {
+            "left": [f"left_{joint}", f"LEFT_{joint.upper()}"],
+            "right": [f"right_{joint}", f"RIGHT_{joint.upper()}"],
+        }
+        # MediaPipe 数字索引
+        MEDIAPIPE_IDX = {
+            "hip": ("23", "24"),
+            "shoulder": ("11", "12"),
+            "knee": ("25", "26"),
+            "ankle": ("27", "28"),
+            "elbow": ("13", "14"),
+            "wrist": ("15", "16"),
+        }
+        if joint in MEDIAPIPE_IDX:
+            ALIASES["left"].append(MEDIAPIPE_IDX[joint][0])
+            ALIASES["right"].append(MEDIAPIPE_IDX[joint][1])
+
+        def _get_pos(fd, side):
+            positions = getattr(fd, "positions", {}) or {}
+            for alias in ALIASES[side]:
+                v = positions.get(alias)
+                if v is not None and len(v) >= 2:
+                    return float(v[0]), float(v[1])
+            return None, None
+
+        for i, fd in enumerate(frame_data_list):
+            lx, ly = _get_pos(fd, "left")
+            rx, ry = _get_pos(fd, "right")
+            if lx is not None:
+                left[i, 0] = lx
+                left[i, 1] = ly
+            if rx is not None:
+                right[i, 0] = rx
+                right[i, 1] = ry
+
+        l_valid = int(np.sum(np.isfinite(left[:, 0])))
+        r_valid = int(np.sum(np.isfinite(right[:, 0])))
+
+        print(f"   🍑 [坐标提取] {joint}: 左={l_valid}/{n} 右={r_valid}/{n}")
 
         left_out = left if l_valid > 0 else None
         right_out = right if r_valid > 0 else None

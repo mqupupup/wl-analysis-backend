@@ -47,6 +47,7 @@ class MetricStatus(str, Enum):
 
 class ErrorStatus(str, Enum):
     DETECTED = "detected"
+    SUSPECTED = "suspected"
     NOT_DETECTED = "not_detected"
     INSUFFICIENT_DATA = "insufficient_data"
 

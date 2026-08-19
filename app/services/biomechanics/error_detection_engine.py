@@ -16,6 +16,7 @@ import warnings
 
 from app.domain.models import RepContext
 from app.domain.enums import ValidationStatus, ErrorStatus, ErrorSeverity
+from .butt_contact_analyzer import ButtContactAnalyzer
 
 
 @dataclass
@@ -166,6 +167,10 @@ def detect_elbow_flare(rep: RepContext) -> ErrorDetection:
     不是 elbow joint angle！
 
     取 bottom 帧附近的 upper_arm_torso_angle，>80° 判定为明显外展。
+
+    V3.1 修复：加单侧视角/数据质量可信度控制。
+    - 双侧都有数据 → confidence=0.8
+    - 只有单侧数据（bilateral_ratio<0.65）→ confidence 降至 0.55~0.65（透视可能影响角度）
     """
     eid = "bench_elbow_flare"
 
@@ -173,8 +178,12 @@ def detect_elbow_flare(rep: RepContext) -> ErrorDetection:
     bf_rel = rep.bottom_frame - rep.start_frame
     window = max(1, int(0.1 * rep.fps))
 
-    values = []
-    for side_arr in [rep.left_upper_arm_torso, rep.right_upper_arm_torso]:
+    left_values = []
+    right_values = []
+    for side_arr, side_list in [
+        (rep.left_upper_arm_torso, left_values),
+        (rep.right_upper_arm_torso, right_values),
+    ]:
         if side_arr is None:
             continue
         start = max(0, bf_rel - window)
@@ -183,9 +192,14 @@ def detect_elbow_flare(rep: RepContext) -> ErrorDetection:
             seg = np.asarray(side_arr[start:end], dtype=float)
             seg = seg[np.isfinite(seg)]
             if len(seg) > 0:
-                values.append(float(np.median(seg)))
+                side_list.append(float(np.median(seg)))
 
-    if not values:
+    # 统计双侧数据可用性
+    left_has = len(left_values) > 0
+    right_has = len(right_values) > 0
+    bilateral_ratio = float(getattr(rep, "bilateral_valid_ratio", 0.0))
+
+    if not left_has and not right_has:
         return ErrorDetection(
             eid, rep.rep_index,
             ErrorStatus.INSUFFICIENT_DATA,
@@ -193,7 +207,19 @@ def detect_elbow_flare(rep: RepContext) -> ErrorDetection:
             confidence=0.0,
         )
 
-    angle = float(np.max(values))  # 取较大的一侧（更外展的一侧）
+    # 取较大的一侧（更外展的一侧）
+    all_values = left_values + right_values
+    angle = float(np.max(all_values))
+
+    # 可信度控制：单侧视角降低 confidence
+    # 双侧都有数据 → 0.8
+    # 只有单侧数据 或 bilateral_ratio<0.65 → 0.55（透视可能影响角度准确性）
+    if left_has and right_has and bilateral_ratio >= 0.65:
+        base_confidence = 0.8
+        view_note = "双侧数据"
+    else:
+        base_confidence = 0.55
+        view_note = f"单侧视角(bilateral_ratio={bilateral_ratio:.3f})，透视可能影响角度准确性"
 
     if angle > 90.0:
         sev = ErrorSeverity.SEVERE
@@ -204,14 +230,14 @@ def detect_elbow_flare(rep: RepContext) -> ErrorDetection:
     else:
         return ErrorDetection(
             eid, rep.rep_index, ErrorStatus.NOT_DETECTED,
-            value=angle, threshold=75.0, confidence=0.8,
-            detail=f"upper_arm_torso={angle:.1f}°",
+            value=angle, threshold=75.0, confidence=base_confidence,
+            detail=f"upper_arm_torso={angle:.1f}° ({view_note})",
         )
 
     return ErrorDetection(
         eid, rep.rep_index, ErrorStatus.DETECTED, sev,
-        value=angle, threshold=75.0, confidence=0.8,
-        detail=f"upper_arm_torso={angle:.1f}°",
+        value=angle, threshold=75.0, confidence=base_confidence,
+        detail=f"upper_arm_torso={angle:.1f}° ({view_note})",
     )
 
 
@@ -268,13 +294,57 @@ def detect_bounce(rep: RepContext) -> ErrorDetection:
                               detail="; ".join(details) if details else "正常触胸")
 
 
-def detect_hip_lift(rep: RepContext) -> ErrorDetection:
-    """需要髋部角度数据，当前不可用。注意：应检测臀部离凳(butt-off)，而非单纯起桥(arch)。"""
+def detect_butt_off_bench(rep: RepContext) -> ErrorDetection:
+    """
+    V1: 臀部离凳检测（Pose-only）。
+
+    使用 ButtContactAnalyzer 分析骨盆相对肩部的抬升模式。
+    - normal_arch → NOT_DETECTED
+    - suspected_lift → SUSPECTED（置信度 0.55~0.80）
+    - confirmed_lift → DETECTED（置信度 >=0.80，V1 很难达到）
+    - insufficient_data → INSUFFICIENT_DATA
+    """
+    eid = "bench_butt_off_bench"
+
+    analyzer = ButtContactAnalyzer()
+    result = analyzer.analyze(rep)
+
+    print(f"\n   🍑 [最终检测] Rep {rep.rep_index}: status={result.status}, "
+          f"confidence={result.confidence:.2f}, max_lift={result.max_relative_lift}, "
+          f"separated_frames={result.separated_frames}, reason={result.reason}")
+    print(f"   🍑 [最终检测] Rep {rep.rep_index}: detail={result.detail}")
+
+    if result.status == "insufficient_data":
+        return ErrorDetection(
+            eid, rep.rep_index, ErrorStatus.INSUFFICIENT_DATA,
+            detail=result.detail or "缺少髋部坐标数据",
+            confidence=0.0,
+        )
+
+    if result.status == "normal_arch":
+        return ErrorDetection(
+            eid, rep.rep_index, ErrorStatus.NOT_DETECTED,
+            value=result.max_relative_lift,
+            confidence=result.confidence,
+            detail=result.detail or "正常起桥，未检测到臀部离凳",
+        )
+
+    if result.status == "suspected_lift":
+        return ErrorDetection(
+            eid, rep.rep_index, ErrorStatus.SUSPECTED,
+            ErrorSeverity.MODERATE,
+            value=result.max_relative_lift,
+            confidence=result.confidence,
+            detail=f"疑似臀部离凳: {result.detail}",
+        )
+
+    # confirmed_lift
     return ErrorDetection(
-        "bench_butt_off_bench", rep.rep_index,
-        ErrorStatus.INSUFFICIENT_DATA,
-        detail="需要髋部/臀部接触数据，当前不可用",
-        confidence=0.0,
+        eid, rep.rep_index, ErrorStatus.DETECTED,
+        ErrorSeverity.SEVERE,
+        value=result.max_relative_lift,
+        confidence=result.confidence,
+        detail=f"确认臀部离凳: {result.detail}",
     )
 
 
@@ -326,7 +396,7 @@ BENCH_RULES = [
     detect_incomplete_lockout,
     detect_elbow_flare,
     detect_bounce,
-    detect_hip_lift,
+    detect_butt_off_bench,
     detect_asymmetric_push,
 ]
 
@@ -347,7 +417,8 @@ class ErrorDetectionEngineFixed:
         results: List[SetLevelError] = []
 
         for eid, dets in all_det.items():
-            hits = [d for d in dets if d.status == ErrorStatus.DETECTED]
+            # 统计 DETECTED 和 SUSPECTED 的错误
+            hits = [d for d in dets if d.status in (ErrorStatus.DETECTED, ErrorStatus.SUSPECTED)]
             if not hits:
                 continue
             vals = [d.value for d in hits if d.value is not None]
