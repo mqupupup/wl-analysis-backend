@@ -1,0 +1,457 @@
+{
+    "meta": {
+        "id": "bench_press",
+        "name_en": "Barbell Bench Press",
+        "name_zh": "杠铃卧推",
+        "motion_chain": "upper_body",
+        "pattern": "horizontal_push",
+        "primary_joints": [
+            "shoulder",
+            "elbow"
+        ],
+        "primary_muscles": [
+            "胸大肌",
+            "三角肌前束",
+            "肱三头肌"
+        ],
+        "equipment": [
+            "barbell",
+            "bench"
+        ],
+        "typical_rom": {
+            "elbow_angle": {
+                "min": 50,
+                "max": 170
+            }
+        }
+    },
+    "phases": {
+        "states": [
+            "setup",
+            "eccentric",
+            "concentric",
+            "lockout",
+            "rest"
+        ],
+        "transitions": [
+            {
+                "from": "setup",
+                "to": "eccentric",
+                "condition": "elbow_angle decreasing AND elbow_angle_decreased > 5",
+                "description": "肘角连续下降超过5°，确认开始下放"
+            },
+            {
+                "from": "eccentric",
+                "to": "concentric",
+                "condition": "elbow_angle rising_from_min > 3 AND elbow_angle_decreased > 20",
+                "description": "【底部事件】肘角从最低点回升>3°，且累计下降>20°（兼容Touch&Go和暂停卧推）"
+            },
+            {
+                "from": "concentric",
+                "to": "lockout",
+                "condition": "elbow_angle dropping_from_max > 3 OR elbow_angle stable_for > 0.2s",
+                "description": "【顶点事件】肘角从最高点回落>3°，或在高位稳定>0.2s"
+            },
+            {
+                "from": "lockout",
+                "to": "rest",
+                "condition": "elbow_angle stable_for > 0.3s",
+                "description": "锁定后保持稳定超过0.3秒，进入休息"
+            },
+            {
+                "from": "rest",
+                "to": "eccentric",
+                "condition": "elbow_angle decreasing AND elbow_angle_decreased > 5",
+                "description": "休息后肘角再次下降超过5°，开始下一次"
+            }
+        ],
+        "critical_frames": {
+            "bottom": "eccentric→concentric 转换帧（bottom_frame），用于检测触胸位置、肘外展、ROM",
+            "top": "concentric→lockout 转换帧（top_frame），用于检测锁死完整性",
+            "sticking_point": "concentric阶段速度最低帧"
+        }
+    },
+    "key_points": [
+        {
+            "id": "bar_path",
+            "name_zh": "杠铃轨迹",
+            "name_en": "Bar Path",
+            "weight": 0.25,
+            "measure": {
+                "method": "wrist_midpoint_trajectory",
+                "points": [
+                    "left_wrist",
+                    "right_wrist"
+                ],
+                "at_phase": [
+                    "eccentric",
+                    "concentric"
+                ],
+                "ideal_path": "下降：肩关节→下胸 斜线; 推起：下胸→肩关节 斜线（J型曲线）"
+            },
+            "scoring": {
+                "excellent": "接近理想J型曲线，水平偏移 < 5%",
+                "good": "偏移 5-10%",
+                "poor": "偏移 > 15% 或 直上直下"
+            },
+            "score_map": {
+                "deviation_under_5pct": 100,
+                "deviation_5_to_10pct": 80,
+                "deviation_10_to_15pct": 60,
+                "deviation_over_15pct": 35
+            }
+        },
+        {
+            "id": "elbow_tuck",
+            "name_zh": "肘部角度",
+            "name_en": "Elbow Angle (Tuck vs Flare)",
+            "weight": 0.2,
+            "measure": {
+                "method": "angle_between",
+                "points": [
+                    "shoulder",
+                    "elbow"
+                ],
+                "reference": "torso_axis",
+                "at_frame": "bottom",
+                "ideal": "上臂与躯干夹角 45-60°"
+            },
+            "scoring": {
+                "excellent": "上臂-躯干角 45-60°（自然内收）",
+                "good": "30-45° 或 60-75°",
+                "poor": "< 30°（过度夹紧）或 > 80°（肘外展/T型）"
+            },
+            "score_map": {
+                "angle_45_to_60": 100,
+                "angle_30_to_45_or_60_to_75": 80,
+                "angle_under_30_or_75_to_80": 55,
+                "angle_over_80": 25
+            }
+        },
+        {
+            "id": "touch_point",
+            "name_zh": "触胸位置",
+            "name_en": "Touch Point",
+            "weight": 0.15,
+            "measure": {
+                "method": "wrist_y_relative_to_shoulder",
+                "points": [
+                    "wrist_midpoint",
+                    "shoulder"
+                ],
+                "at_frame": "bottom",
+                "ideal": "手腕在肩关节下方或略偏下（下胸/胸骨剑突）"
+            },
+            "scoring": {
+                "excellent": "触胸点在胸骨中下部",
+                "good": "触胸点略高（中胸）",
+                "poor": "触胸点过高（锁骨区）或过低（腹部）"
+            },
+            "score_map": {
+                "lower_chest": 100,
+                "mid_chest": 80,
+                "upper_chest": 50,
+                "neck_or_abs": 25
+            }
+        },
+        {
+            "id": "symmetry",
+            "name_zh": "左右对称性",
+            "name_en": "Bilateral Symmetry",
+            "weight": 0.2,
+            "measure": {
+                "method": "compare_sides",
+                "points": [
+                    "left_elbow_angle",
+                    "right_elbow_angle"
+                ],
+                "at_phase": [
+                    "eccentric",
+                    "concentric"
+                ],
+                "rule": "两侧肘角差异 < 10°"
+            },
+            "scoring": {
+                "excellent": "左右肘角差异 < 5°",
+                "good": "差异 5-10°",
+                "poor": "差异 > 15°"
+            },
+            "score_map": {
+                "diff_under_5": 100,
+                "diff_5_to_10": 80,
+                "diff_10_to_15": 55,
+                "diff_over_15": 25
+            }
+        },
+        {
+            "id": "tempo",
+            "name_zh": "动作节奏",
+            "name_en": "Tempo Control",
+            "weight": 0.2,
+            "measure": {
+                "method": "phase_duration_ratio",
+                "ideal": {
+                    "eccentric": "1.5-3.0s",
+                    "concentric": "0.8-2.0s"
+                }
+            },
+            "scoring": {
+                "excellent": "下降 1.5-3s + 推起 0.8-2s",
+                "good": "偏快或偏慢但在合理范围",
+                "poor": "下降 < 0.5s（砸胸）或 无控制"
+            },
+            "score_map": {
+                "ideal_tempo": 100,
+                "acceptable_tempo": 75,
+                "too_fast_eccentric": 40,
+                "no_control": 25
+            }
+        }
+    ],
+    "errors": [
+        {
+            "id": "bench_incomplete_rom",
+            "name_zh": "动作幅度不足",
+            "name_en": "Incomplete Range of Motion",
+            "severity": "medium",
+            "injury_risk": [
+                "肌力发展受限"
+            ],
+            "detect": {
+                "method": "min_elbow_angle_at_bottom",
+                "condition": "bottom_elbow_angle > 90",
+                "at_frame": "bottom"
+            },
+            "severity_levels": {
+                "minor": {
+                    "threshold": "底部肘角 80-90°",
+                    "score_penalty": -5
+                },
+                "moderate": {
+                    "threshold": "底部肘角 90-110°（半程）",
+                    "score_penalty": -15
+                },
+                "severe": {
+                    "threshold": "底部肘角 > 110°（大幅半程）",
+                    "score_penalty": -30
+                }
+            },
+            "feedback_zh": "⚠️ 动作幅度不足：杠铃未触胸就开始推起（底部肘角 {angle}°）。降低重量，确保每次杠铃轻触胸部后再推起。",
+            "fix_exercises": [
+                "暂停卧推",
+                "哑铃卧推（更大ROM）",
+                "减少重量"
+            ]
+        },
+        {
+            "id": "bench_incomplete_lockout",
+            "name_zh": "锁定不完整",
+            "name_en": "Incomplete Lockout",
+            "severity": "low",
+            "injury_risk": [],
+            "detect": {
+                "method": "max_elbow_angle_at_top",
+                "condition": "top_elbow_angle < 155",
+                "at_frame": "top"
+            },
+            "severity_levels": {
+                "minor": {
+                    "threshold": "顶部肘角 145-155°",
+                    "score_penalty": -3
+                },
+                "moderate": {
+                    "threshold": "顶部肘角 < 145°",
+                    "score_penalty": -8
+                }
+            },
+            "feedback_zh": "⚠️ 手臂未完全伸直：推起最高点肘角仅 {angle}°，尝试在顶部完全锁定肘关节。",
+            "fix_exercises": [
+                "弹力带卧推",
+                "三头肌强化训练"
+            ]
+        },
+        {
+            "id": "bench_elbow_flare",
+            "name_zh": "肘部过度外展（T型卧推）",
+            "name_en": "Elbow Flare",
+            "severity": "high",
+            "injury_risk": [
+                "肩关节撞击",
+                "肩袖损伤",
+                "AC关节压力"
+            ],
+            "detect": {
+                "method": "angle_at_frame",
+                "condition": "upper_arm_torso_angle > 75",
+                "at_frame": "bottom"
+            },
+            "severity_levels": {
+                "minor": {
+                    "threshold": "外展角 70-80°",
+                    "score_penalty": -10
+                },
+                "moderate": {
+                    "threshold": "外展角 80-90°",
+                    "score_penalty": -25
+                },
+                "severe": {
+                    "threshold": "外展角 > 90°（完全T型）",
+                    "score_penalty": -40
+                }
+            },
+            "feedback_zh": "⚠️ 肘部过度外展：上臂与躯干夹角过大（{angle}°），对肩关节压力大。尝试将肘部向身体方向内收约45°，想象用肘部画箭头而不是T字。",
+            "fix_exercises": [
+                "哑铃卧推（自然内收）",
+                "地板卧推",
+                "弹力带拉伸肩关节"
+            ]
+        },
+        {
+            "id": "bench_bounce",
+            "name_zh": "胸部弹震（砸胸）",
+            "name_en": "Chest Bounce",
+            "severity": "high",
+            "injury_risk": [
+                "胸骨/肋骨损伤",
+                "失去肌肉张力"
+            ],
+            "detect": {
+                "method": "bottom_velocity",
+                "condition": "velocity_at_bottom > threshold AND bottom_pause_frames < 3",
+                "at_frame": "bottom"
+            },
+            "severity_levels": {
+                "minor": {
+                    "threshold": "底部停顿 < 0.1s",
+                    "score_penalty": -10
+                },
+                "moderate": {
+                    "threshold": "明显弹震",
+                    "score_penalty": -25
+                },
+                "severe": {
+                    "threshold": "快速砸胸反弹",
+                    "score_penalty": -40
+                }
+            },
+            "feedback_zh": "⚠️ 底部弹震：杠铃触胸后没有控制停顿，利用弹力反弹推起。每次触胸后暂停0.3-0.5秒，确保完全控制后再推起。",
+            "fix_exercises": [
+                "暂停卧推（2-3秒停顿）",
+                "Spoto Press",
+                "哑铃卧推"
+            ]
+        },
+        {
+            "id": "bench_hip_lift",
+            "name_zh": "臀部离凳",
+            "name_en": "Hip Lift Off Bench",
+            "severity": "medium",
+            "injury_risk": [
+                "腰椎过伸",
+                "下背疼痛"
+            ],
+            "detect": {
+                "method": "hip_y_relative_to_shoulder_knee",
+                "condition": "hip_y significantly above shoulder-hip line",
+                "at_phase": "concentric"
+            },
+            "severity_levels": {
+                "minor": {
+                    "threshold": "臀部轻微抬起",
+                    "score_penalty": -10
+                },
+                "moderate": {
+                    "threshold": "臀部明显离凳",
+                    "score_penalty": -20
+                },
+                "severe": {
+                    "threshold": "臀部大幅抬起（过度拱桥）",
+                    "score_penalty": -35
+                }
+            },
+            "feedback_zh": "⚠️ 推起时臀部离开凳面：虽然适度起桥是合理的，但臀部完全离凳会增加腰椎压力。保持臀部始终接触凳面。",
+            "fix_exercises": [
+                "脚踩凳子卧推",
+                "哑铃卧推",
+                "核心稳定性训练"
+            ]
+        },
+        {
+            "id": "bench_asymmetric_push",
+            "name_zh": "左右发力不对称",
+            "name_en": "Asymmetric Press",
+            "severity": "medium",
+            "injury_risk": [
+                "单侧肩袖过劳",
+                "杠铃偏移"
+            ],
+            "detect": {
+                "method": "elbow_angle_diff",
+                "condition": "abs(left_elbow_angle - right_elbow_angle) > 15",
+                "at_phase": "concentric"
+            },
+            "severity_levels": {
+                "minor": {
+                    "threshold": "差异 10-15°",
+                    "score_penalty": -8
+                },
+                "moderate": {
+                    "threshold": "差异 15-25°",
+                    "score_penalty": -18
+                },
+                "severe": {
+                    "threshold": "差异 > 25°",
+                    "score_penalty": -30
+                }
+            },
+            "feedback_zh": "⚠️ 左右臂发力不对称：{weaker_side}侧推起速度明显慢于另一侧。建议增加单侧训练（哑铃卧推）改善弱侧。",
+            "fix_exercises": [
+                "单臂哑铃卧推",
+                "单臂绳索推胸",
+                "弱侧优先训练"
+            ]
+        }
+    ],
+  "rep_detection": {
+    "primary_angle": "elbow_angle_avg",
+    "min_distance_sec": 0.6,
+    "min_prominence": 8.0,
+    "min_eccentric_duration_s": 0.20,
+    "min_concentric_duration_s": 0.20,
+    "min_bottom_to_bottom_frames": 20,
+    "max_closure_deg": 60.0,
+    "ideal_min_rom_deg": 55.0,
+    "ideal_max_rom_deg": 140.0,
+    "ideal_closure_deg": 20.0,
+    "min_cycle_duration_s": 0.5,
+    "max_cycle_duration_s": 5.0,
+    "min_chain_score": 0.25,
+    "rhythm_tolerance": 0.4,
+    "max_candidates_per_valley": 3,
+    "min_rom_existence": 15.0,
+    "min_rom_no_pause": 40.0,
+    "bilateral_min_ratio": 0.65
+  },
+    "feedback_rules": {
+        "excellent": {
+            "condition": "total_score >= 90",
+            "zh": "🏆 卧推技术出色！{rep_count}次动作控制精准，杠铃轨迹理想。",
+            "en": "Excellent bench press technique! {rep_count} reps with precise bar path."
+        },
+        "good": {
+            "condition": "total_score >= 75",
+            "zh": "👍 卧推整体良好。{top_error}",
+            "en": "Good bench press overall. {top_error}"
+        },
+        "needs_work": {
+            "condition": "total_score >= 60",
+            "zh": "🔧 卧推需要改进：{top_error}，{second_error}",
+            "en": "Bench press needs work: {top_error}, {second_error}"
+        },
+        "poor": {
+            "condition": "total_score < 60",
+            "zh": "⛔ 卧推存在安全隐患：{top_error}。建议立即降低重量。",
+            "en": "Safety concern: {top_error}. Reduce weight immediately."
+        }
+    }
+}

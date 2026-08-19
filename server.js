@@ -163,119 +163,310 @@ app.get('/get-uploaded-chunks/:sessionId', (req, res) => {
 });
 
 // 合并分块并分析 - 修复版本（使用 axios）
+// app.post('/merge-and-analyze', async (req, res) => {
+//   console.log('Received merge-and-analyze request');
+//   try {
+//     const { sessionId } = req.body;
+    
+//     if (!sessionId) {
+//       return res.status(400).json({ 
+//         error: 'Missing session ID',
+//         success: false
+//       });
+//     }
+
+//     const session = uploadSessions.get(sessionId);
+//     if (!session) {
+//       return res.status(404).json({ 
+//         error: 'Upload session not found',
+//         success: false
+//       });
+//     }
+
+//     if (session.uploadedChunks.size !== session.totalChunks) {
+//       return res.status(400).json({ 
+//         error: `Incomplete upload: ${session.uploadedChunks.size}/${session.totalChunks} chunks`,
+//         success: false
+//       });
+//     }
+
+//     // 合并文件
+//     const outputPath = path.join(UPLOADS_DIR, session.fileName);
+//     const writeStream = fsSync.createWriteStream(outputPath);
+    
+//     for (let i = 0; i < session.totalChunks; i++) {
+//       const chunkPath = path.join(CHUNKS_DIR, `${session.fileName}.part${i}`);
+//       const chunkData = await fs.readFile(chunkPath);
+//       writeStream.write(chunkData);
+//       await fs.unlink(chunkPath);
+//     }
+    
+//     writeStream.end();
+
+//     await new Promise((resolve) => {
+//       writeStream.on('finish', resolve);
+//       writeStream.on('error', resolve);
+//     });
+
+//     uploadSessions.delete(sessionId);
+
+//     console.log('✅ File merged successfully:', outputPath);
+
+//     // === 调用 FastAPI 后端进行真实分析 ===
+//     console.log('🚀 Calling FastAPI backend (http://localhost:8001/analyze-barbell)...');
+    
+//     const formData = new FormData();
+//     const videoBuffer = await fs.readFile(outputPath);
+    
+//     formData.append('video', videoBuffer, {
+//       filename: session.fileName,
+//       contentType: 'video/mp4'
+//     });
+
+//     const response = await axios.post(
+//       'http://localhost:8001/analyze-barbell',
+//       formData,
+//       {
+//         headers: {
+//           ...formData.getHeaders(),
+//           'Content-Type': `multipart/form-data; boundary=${formData.getBoundary()}`
+//         },
+//         maxContentLength: Infinity,
+//         maxBodyLength: Infinity,
+//         timeout: 300000
+//       }
+//     );
+
+//     console.log('✅ Analysis completed!');
+//     console.log('   Exercise Type:', response.data.exercise_type);
+//     console.log('   Score:', response.data.score);
+//     console.log('   Stability:', response.data.stability);
+
+//     res.json({
+//       success: true,
+//       analysis_id: response.data.analysis_id,
+//       exercise_type: response.data.exercise_type,
+//       score: response.data.score,
+//       stability: response.data.stability,
+//       offset: response.data.offset,
+//       avg_speed: response.data.avg_speed,
+//       max_speed: response.data.max_speed,
+//       sticking_point: response.data.sticking_point,
+//       rpe: response.data.rpe,
+//       feedback: response.data.feedback,
+//       thumbnailUrl: response.data.thumbnailUrl,
+//       videoUrl: response.data.videoUrl,
+//       trajectory: response.data.trajectory
+//     });
+
+//   } catch (error) {
+//     console.error('❌ Merge and analysis error:', error);
+    
+//     let errorMessage = 'Failed to merge and analyze';
+//     if (error.response) {
+//       console.error('FastAPI error response:', error.response.data);
+//       errorMessage = `FastAPI error: ${JSON.stringify(error.response.data)}`;
+//     } else if (error.code === 'ECONNREFUSED') {
+//       errorMessage = '无法连接到 FastAPI 后端';
+//     } else {
+//       errorMessage = error.message;
+//     }
+    
+//     res.status(500).json({ 
+//       error: errorMessage,
+//       success: false,
+//       details: error.message
+//     });
+//   }
+// });
 app.post('/merge-and-analyze', async (req, res) => {
-  console.log('Received merge-and-analyze request');
+  console.log('📥 Received merge-and-analyze request');
+  
   try {
     const { sessionId } = req.body;
     
     if (!sessionId) {
-      return res.status(400).json({ 
-        error: 'Missing session ID',
-        success: false
-      });
+      return res.status(400).json({ error: 'Missing session ID', success: false });
     }
 
     const session = uploadSessions.get(sessionId);
     if (!session) {
-      return res.status(404).json({ 
-        error: 'Upload session not found',
-        success: false
-      });
+      return res.status(404).json({ error: 'Upload session not found', success: false });
     }
 
     if (session.uploadedChunks.size !== session.totalChunks) {
       return res.status(400).json({ 
-        error: `Incomplete upload: ${session.uploadedChunks.size}/${session.totalChunks} chunks`,
-        success: false
+        error: `Incomplete upload: ${session.uploadedChunks.size}/${session.totalChunks}`,
+        success: false 
       });
     }
 
-    // 合并文件
+    // ✅ 修复1: 使用异步 writeStream + 正确的事件监听
     const outputPath = path.join(UPLOADS_DIR, session.fileName);
-    const writeStream = fsSync.createWriteStream(outputPath);
+    console.log(`🔧 Merging to: ${outputPath}`);
     
-    for (let i = 0; i < session.totalChunks; i++) {
-      const chunkPath = path.join(CHUNKS_DIR, `${session.fileName}.part${i}`);
-      const chunkData = await fs.readFile(chunkPath);
-      writeStream.write(chunkData);
-      await fs.unlink(chunkPath);
-    }
-    
-    writeStream.end();
+    try {
+      await new Promise((resolve, reject) => {
+        const writeStream = fsSync.createWriteStream(outputPath);
+        
+        writeStream.on('error', (err) => {
+          console.error('❌ WriteStream error:', err);
+          reject(err);
+        });
 
-    await new Promise((resolve) => {
-      writeStream.on('finish', resolve);
-      writeStream.on('error', resolve);
-    });
+        (async () => {
+          try {
+            for (let i = 0; i < session.totalChunks; i++) {
+              const chunkPath = path.join(CHUNKS_DIR, `${session.fileName}.part${i}`);
+              const chunkData = await fs.readFile(chunkPath);
+              writeStream.write(chunkData);
+              await fs.unlink(chunkPath);
+              console.log(`   ✓ Chunk ${i}/${session.totalChunks} merged`);
+            }
+            writeStream.end();
+          } catch (err) {
+            writeStream.destroy(err);
+            reject(err);
+          }
+        })();
+
+        writeStream.on('finish', () => {
+          console.log(`✅ File merged: ${outputPath}`);
+          resolve();
+        });
+      });
+    } catch (mergeErr) {
+      console.error('❌ Merge failed:', mergeErr);
+      return res.status(500).json({
+        error: 'File merge failed',
+        success: false,
+        details: mergeErr.message,
+      });
+    }
 
     uploadSessions.delete(sessionId);
 
-    console.log('✅ File merged successfully:', outputPath);
+    // ✅ 修复2: 验证合并后的文件存在且大小合理
+    try {
+      const stats = await fs.stat(outputPath);
+      console.log(`📊 Merged file size: ${(stats.size / 1024 / 1024).toFixed(2)}MB`);
+      if (stats.size < 1000) {
+        throw new Error(`Merged file too small: ${stats.size} bytes`);
+      }
+    } catch (statErr) {
+      console.error('❌ File stat failed:', statErr);
+      return res.status(500).json({
+        error: 'Merged file verification failed',
+        success: false,
+        details: statErr.message,
+      });
+    }
 
-    // === 调用 FastAPI 后端进行真实分析 ===
-    console.log('🚀 Calling FastAPI backend (http://localhost:8001/analyze-barbell)...');
-    
-    const formData = new FormData();
-    const videoBuffer = await fs.readFile(outputPath);
-    
-    formData.append('video', videoBuffer, {
-      filename: session.fileName,
-      contentType: 'video/mp4'
-    });
+    // ✅ 修复3: 调用 FastAPI 前检查连通性
+    const fastApiUrl = process.env.FASTAPI_URL || 'http://localhost:8001';
+    const analyzeEndpoint = `${fastApiUrl}/analyze-barbell`;
+    console.log(`🚀 Calling FastAPI: ${analyzeEndpoint}`);
 
-    const response = await axios.post(
-      'http://localhost:8001/analyze-barbell',
-      formData,
-      {
+    // 先做健康检查
+    try {
+      const healthCheck = await axios.get(`${fastApiUrl}/health`, { timeout: 5000 });
+      console.log(`✅ FastAPI healthy:`, healthCheck.data);
+    } catch (healthErr) {
+      console.error('❌ FastAPI health check failed:', healthErr.message);
+      return res.status(502).json({
+        error: 'FastAPI backend unavailable',
+        success: false,
+        details: healthErr.message,
+        url: `${fastApiUrl}/health`,
+      });
+    }
+
+    // ✅ 修复4: 安全的 FormData 构建 + 详细错误捕获
+    let response;
+    try {
+      const formData = new FormData();
+      const videoBuffer = await fs.readFile(outputPath);
+      
+      formData.append('video', videoBuffer, {
+        filename: session.fileName,
+        contentType: 'video/mp4',
+      });
+
+      response = await axios.post(analyzeEndpoint, formData, {
         headers: {
           ...formData.getHeaders(),
-          'Content-Type': `multipart/form-data; boundary=${formData.getBoundary()}`
         },
         maxContentLength: Infinity,
         maxBodyLength: Infinity,
-        timeout: 300000
+        timeout: 300000, // 5分钟
+      });
+    } catch (axiosErr) {
+      console.error('❌ FastAPI call failed:');
+      
+      if (axiosErr.response) {
+        // FastAPI 返回了错误响应
+        console.error('   Status:', axiosErr.response.status);
+        console.error('   Data:', JSON.stringify(axiosErr.response.data));
+        return res.status(axiosErr.response.status).json({
+          error: `FastAPI analysis error`,
+          success: false,
+          fastapi_status: axiosErr.response.status,
+          fastapi_response: axiosErr.response.data,
+        });
+      } else if (axiosErr.code === 'ECONNREFUSED') {
+        console.error('   Connection refused to:', analyzeEndpoint);
+        return res.status(502).json({
+          error: 'Cannot connect to FastAPI backend',
+          success: false,
+          url: analyzeEndpoint,
+        });
+      } else if (axiosErr.code === 'ECONNABORTED') {
+        console.error('   Request timed out after 300s');
+        return res.status(504).json({
+          error: 'FastAPI analysis timed out (>5min)',
+          success: false,
+        });
+      } else {
+        console.error('   Unknown error:', axiosErr.message);
+        return res.status(500).json({
+          error: 'FastAPI call failed',
+          success: false,
+          details: axiosErr.message,
+        });
       }
-    );
+    }
 
     console.log('✅ Analysis completed!');
-    console.log('   Exercise Type:', response.data.exercise_type);
-    console.log('   Score:', response.data.score);
-    console.log('   Stability:', response.data.stability);
+    console.log('   Response keys:', Object.keys(response.data || {}));
 
+    // ✅ 修复5: 安全地提取响应字段（防止 undefined）
+    const data = response.data || {};
     res.json({
       success: true,
-      analysis_id: response.data.analysis_id,
-      exercise_type: response.data.exercise_type,
-      score: response.data.score,
-      stability: response.data.stability,
-      offset: response.data.offset,
-      avg_speed: response.data.avg_speed,
-      max_speed: response.data.max_speed,
-      sticking_point: response.data.sticking_point,
-      rpe: response.data.rpe,
-      feedback: response.data.feedback,
-      thumbnailUrl: response.data.thumbnailUrl,
-      videoUrl: response.data.videoUrl,
-      trajectory: response.data.trajectory
+      analysis_id: data.analysis_id || sessionId,
+      exercise_type: data.exercise_type || 'Unknown',
+      score: data.score ?? data.quality?.total_score ?? null,
+      stability: data.stability ?? null,
+      offset: data.offset ?? null,
+      avg_speed: data.avg_speed ?? null,
+      max_speed: data.max_speed ?? null,
+      sticking_point: data.sticking_point ?? null,
+      rpe: data.rpe ?? null,
+      feedback: data.feedback || [],
+      thumbnailUrl: data.thumbnailUrl || null,
+      videoUrl: data.videoUrl || null,
+      trajectory: data.trajectory || [],
+      _raw_keys: Object.keys(data), // 调试用：看到 FastAPI 实际返回了什么
     });
 
   } catch (error) {
-    console.error('❌ Merge and analysis error:', error);
-    
-    let errorMessage = 'Failed to merge and analyze';
-    if (error.response) {
-      console.error('FastAPI error response:', error.response.data);
-      errorMessage = `FastAPI error: ${JSON.stringify(error.response.data)}`;
-    } else if (error.code === 'ECONNREFUSED') {
-      errorMessage = '无法连接到 FastAPI 后端';
-    } else {
-      errorMessage = error.message;
-    }
-    
-    res.status(500).json({ 
-      error: errorMessage,
+    console.error('❌ Merge-and-analyze FATAL:', error);
+    console.error('   Stack:', error.stack);
+    res.status(500).json({
+      error: 'Internal server error',
       success: false,
-      details: error.message
+      details: error.message,
+      stack: process.env.NODE_ENV !== 'production' ? error.stack : undefined,
     });
   }
 });

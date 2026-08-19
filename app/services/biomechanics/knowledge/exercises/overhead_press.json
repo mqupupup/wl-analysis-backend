@@ -1,0 +1,313 @@
+{
+  "meta": {
+    "id": "overhead_press",
+    "name_en": "Overhead Press (OHP)",
+    "name_zh": "过头推举",
+    "motion_chain": "upper_body",
+    "pattern": "vertical_push",
+    "primary_joints": ["shoulder", "elbow"],
+    "primary_muscles": ["三角肌", "肱三头肌", "前锯肌", "核心肌群"],
+    "equipment": ["barbell"],
+    "typical_rom": {
+      "elbow_angle": { "min": 50, "max": 175 },
+      "shoulder_flexion": { "min": 0, "max": 180 }
+    }
+  },
+
+  "phases": {
+    "states": ["setup", "concentric", "sticking_point", "lockout", "eccentric", "rest"],
+    "transitions": [
+      {
+        "from": "setup",
+        "to": "concentric",
+        "condition": "wrist_y decreasing (moving up) AND elbow_angle increasing",
+        "description": "开始向上推起"
+      },
+      {
+        "from": "concentric",
+        "to": "sticking_point",
+        "condition": "wrist_y velocity minimum (slowest point, usually at forehead height)",
+        "description": "通过最难点（通常在额头高度）"
+      },
+      {
+        "from": "sticking_point",
+        "to": "lockout",
+        "condition": "elbow_angle > 160 AND wrist above head",
+        "description": "通过难点后锁定"
+      },
+      {
+        "from": "lockout",
+        "to": "eccentric",
+        "condition": "wrist_y increasing (lowering)",
+        "description": "开始下放"
+      },
+      {
+        "from": "eccentric",
+        "to": "rest",
+        "condition": "wrist_y ≈ shoulder_height AND stable",
+        "description": "回到肩膀高度"
+      }
+    ],
+    "critical_frames": {
+      "setup": "起手帧 → 检测手腕位置、肘部朝向、躯干角度",
+      "sticking_point": "速度最低帧 → 检测头部后仰是否充分",
+      "lockout": "最高点帧 → 检测杠铃是否在头部正上方"
+    }
+  },
+
+  "key_points": [
+    {
+      "id": "bar_path",
+      "name_zh": "杠铃轨迹",
+      "name_en": "Bar Path",
+      "weight": 0.30,
+      "measure": {
+        "method": "wrist_midpoint_x_trajectory",
+        "points": ["left_wrist", "right_wrist"],
+        "at_phase": ["concentric", "eccentric"],
+        "ideal": "杠铃应从脸部前方直线上升到头部正上方（需要头部配合前移后回）"
+      },
+      "scoring": {
+        "excellent": "杠铃轨迹接近垂直，水平偏移 < 5%",
+        "good": "偏移 5-10%",
+        "poor": "偏移 > 15% 或 弧线过大"
+      },
+      "score_map": {
+        "deviation_under_5pct": 100,
+        "deviation_5_to_10pct": 80,
+        "deviation_10_to_15pct": 55,
+        "deviation_over_15pct": 25
+      }
+    },
+    {
+      "id": "lumbar_control",
+      "name_zh": "腰椎控制",
+      "name_en": "Lumbar Control (Rib Flare)",
+      "weight": 0.25,
+      "measure": {
+        "method": "torso_angle_change",
+        "points": ["shoulder", "hip"],
+        "at_phase": "concentric",
+        "rule": "躯干不应过度后仰（>15°），肋骨不应外翻"
+      },
+      "scoring": {
+        "excellent": "躯干保持直立或轻微后仰 < 10°",
+        "good": "后仰 10-15°",
+        "poor": "后仰 > 20°（过度后仰代偿）"
+      },
+      "score_map": {
+        "torso_under_10": 100,
+        "torso_10_to_15": 80,
+        "torso_15_to_25": 55,
+        "torso_over_25": 25
+      }
+    },
+    {
+      "id": "head_movement",
+      "name_zh": "头部配合",
+      "name_en": "Head Movement Coordination",
+      "weight": 0.15,
+      "measure": {
+        "method": "head_position_relative_to_bar",
+        "points": ["nose_approximation"],
+        "at_phase": ["concentric", "lockout"],
+        "rule": "杠铃过脸时头部后移，杠铃过头后头部回位"
+      },
+      "scoring": {
+        "excellent": "头部正确后让-前移配合",
+        "good": "头部配合基本正确",
+        "poor": "头部不动（杠铃绕弧线）或过度后仰"
+      },
+      "score_map": {
+        "proper_head_tuck": 100,
+        "acceptable": 75,
+        "no_head_movement": 50,
+        "excessive_lean": 30
+      }
+    },
+    {
+      "id": "lockout_position",
+      "name_zh": "锁死位置",
+      "name_en": "Lockout Position",
+      "weight": 0.15,
+      "measure": {
+        "method": "wrist_x_relative_to_shoulder",
+        "points": ["wrist_midpoint", "shoulder_midpoint"],
+        "at_phase": "lockout",
+        "rule": "杠铃应在肩膀正上方"
+      },
+      "scoring": {
+        "excellent": "杠铃在肩关节正上方 ±3%",
+        "good": "偏移 3-8%",
+        "poor": "偏移 > 12%（杠铃在头前或头后）"
+      },
+      "score_map": {
+        "over_shoulder": 100,
+        "slight_offset": 80,
+        "moderate_offset": 55,
+        "severe_offset": 25
+      }
+    },
+    {
+      "id": "symmetry",
+      "name_zh": "左右对称性",
+      "name_en": "Bilateral Symmetry",
+      "weight": 0.15,
+      "measure": {
+        "method": "compare_sides",
+        "points": ["left_elbow_angle", "right_elbow_angle", "left_wrist_y", "right_wrist_y"],
+        "at_phase": ["concentric", "lockout"],
+        "rule": "两侧应同步推起"
+      },
+      "scoring": {
+        "excellent": "左右完全同步",
+        "good": "轻微不同步",
+        "poor": "明显单侧滞后"
+      },
+      "score_map": {
+        "perfect_sync": 100,
+        "minor_asymmetry": 80,
+        "moderate_asymmetry": 55,
+        "severe_asymmetry": 25
+      }
+    }
+  ],
+
+  "errors": [
+    {
+      "id": "ohp_excessive_lean",
+      "name_zh": "躯干过度后仰",
+      "name_en": "Excessive Torso Lean Back",
+      "severity": "high",
+      "injury_risk": ["腰椎过伸", "变成站姿推胸（非OHP）"],
+      "detect": {
+        "method": "torso_angle_at_phase",
+        "condition": "torso_from_vertical > 25",
+        "phase": "concentric",
+        "min_frames": 5
+      },
+      "severity_levels": {
+        "minor": { "threshold": "后仰 20-30°", "score_penalty": -10 },
+        "moderate": { "threshold": "后仰 30-45°", "score_penalty": -25 },
+        "severe": { "threshold": "后仰 > 45°（变成推胸）", "score_penalty": -40 }
+      },
+      "feedback_zh": "⚠️ 躯干过度后仰：推起时身体后仰超过{angle}°，变成了类似站姿推胸的动作。收紧核心和臀部，保持躯干接近垂直，让杠铃走直线过头。",
+      "fix_exercises": ["降低重量", "Z-Press（坐姿地上推举）", "核心抗伸展训练（平板支撑/Dead Bug）"]
+    },
+    {
+      "id": "ohp_rib_flare",
+      "name_zh": "肋骨外翻",
+      "name_en": "Rib Flare",
+      "severity": "medium",
+      "injury_risk": ["腰椎过伸", "核心失稳"],
+      "detect": {
+        "method": "lower_torso_angle",
+        "condition": "lumbar_extension visible as rib cage protrusion",
+        "phase": "concentric",
+        "min_frames": 5
+      },
+      "severity_levels": {
+        "minor": { "threshold": "轻微外翻", "score_penalty": -8 },
+        "moderate": { "threshold": "明显外翻", "score_penalty": -18 },
+        "severe": { "threshold": "严重外翻", "score_penalty": -30 }
+      },
+      "feedback_zh": "⚠️ 肋骨外翻：推举时肋骨向前突出，说明核心没有收紧。推举前深吸一口气收紧腹部，保持肋骨下拉。",
+      "fix_exercises": ["Dead Bug", "Pallof Press", "Z-Press"]
+    },
+    {
+      "id": "ohp_bar_forward",
+      "name_zh": "杠铃轨迹前移过大",
+      "name_en": "Bar Too Far Forward",
+      "severity": "medium",
+      "injury_risk": ["肩关节前侧压力", "力矩增大"],
+      "detect": {
+        "method": "wrist_x_relative_to_shoulder_at_lockout",
+        "condition": "wrist_x significantly in front of shoulder at lockout",
+        "phase": "lockout",
+        "min_frames": 3
+      },
+      "severity_levels": {
+        "minor": { "threshold": "前偏 8-12%", "score_penalty": -8 },
+        "moderate": { "threshold": "前偏 12-18%", "score_penalty": -18 },
+        "severe": { "threshold": "前偏 > 18%", "score_penalty": -30 }
+      },
+      "feedback_zh": "⚠️ 杠铃在头顶前方锁定：理想位置应在肩关节正上方。推起后主动将头部'穿过窗户'（头向前回到杠铃下方）。",
+      "fix_exercises": ["练习头部配合动作", "降低重量", "哑铃肩推"]
+    },
+    {
+      "id": "ohp_knee_bend",
+      "name_zh": "膝盖借力（变成Push Press）",
+      "name_en": "Knee Dip (Unintended Push Press)",
+      "severity": "medium",
+      "injury_risk": ["变成不同动作", "训练目标偏移"],
+      "detect": {
+        "method": "knee_angle_change_at_start",
+        "condition": "knee_angle decrease > 15° before concentric phase",
+        "phase": "setup_to_concentric",
+        "min_frames": 3
+      },
+      "severity_levels": {
+        "minor": { "threshold": "膝弯 10-20°", "score_penalty": -10 },
+        "moderate": { "threshold": "膝弯 20-35°", "score_penalty": -20 },
+        "severe": { "threshold": "膝弯 > 35°（明显Push Press）", "score_penalty": -35 }
+      },
+      "feedback_zh": "⚠️ 使用了膝盖借力：如果你做的是严格推举（Strict Press），膝盖不应弯曲。锁紧膝盖，纯粹用肩部力量推起。如果需要借力，请明确标注为Push Press。",
+      "fix_exercises": ["坐姿推举", "靠墙推举", "降低重量"]
+    },
+    {
+      "id": "ohp_incomplete_rom",
+      "name_zh": "幅度不足",
+      "name_en": "Incomplete Range of Motion",
+      "severity": "low",
+      "injury_risk": ["肌力发展受限"],
+      "detect": {
+        "method": "max_elbow_angle_and_min_wrist_y",
+        "condition": "lockout elbow < 150 OR start wrist above chin",
+        "phase": ["setup", "lockout"],
+        "min_frames": 1
+      },
+      "severity_levels": {
+        "minor": { "threshold": "接近全幅", "score_penalty": -5 },
+        "moderate": { "threshold": "明显半程", "score_penalty": -15 },
+        "severe": { "threshold": "大幅半程", "score_penalty": -25 }
+      },
+      "feedback_zh": "⚠️ 动作幅度不足：应从下巴高度推到手臂完全伸直。降低重量确保全程控制。",
+      "fix_exercises": ["降低重量", "哑铃肩推（更大ROM）", "弹力带推举"]
+    }
+  ],
+
+  "rep_detection": {
+    "primary_angle": "shoulder_flexion_avg",
+    "secondary_angle": "elbow_angle_avg",
+    "peak_type": "maxima",
+    "valley_type": "minima",
+    "min_rom": 30,
+    "min_duration": 0.6,
+    "max_duration": 8.0,
+    "lockout_threshold": 155,
+    "bottom_threshold": 70
+  },
+
+  "feedback_rules": {
+    "excellent": {
+      "condition": "total_score >= 90",
+      "zh": "🏆 过头推举技术出色！躯干稳定，杠铃轨迹垂直。{rep_count}次质量一致。",
+      "en": "Excellent OHP form! Stable torso, vertical bar path."
+    },
+    "good": {
+      "condition": "total_score >= 75",
+      "zh": "👍 过头推举整体良好。{top_error}",
+      "en": "Good OHP overall. {top_error}"
+    },
+    "needs_work": {
+      "condition": "total_score >= 60",
+      "zh": "🔧 过头推举需要改进：{top_error}，{second_error}",
+      "en": "OHP needs improvement: {top_error}, {second_error}"
+    },
+    "poor": {
+      "condition": "total_score < 60",
+      "zh": "⛔ 过头推举存在腰椎风险：{top_error}。建议降低重量，加强核心训练。",
+      "en": "Lumbar risk: {top_error}. Reduce weight, strengthen core."
+    }
+  }
+}

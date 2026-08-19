@@ -1,0 +1,300 @@
+{
+  "meta": {
+    "id": "bicep_curl",
+    "name_en": "Standing Bicep Curl",
+    "name_zh": "站姿弯举",
+    "motion_chain": "upper_body",
+    "pattern": "elbow_flexion",
+    "primary_joints": ["elbow", "shoulder"],
+    "primary_muscles": ["肱二头肌", "肱肌", "肱桡肌"],
+    "equipment": ["barbell", "dumbbell"],
+    "typical_rom": {
+      "elbow_angle": { "min": 25, "max": 170 }
+    }
+  },
+
+  "phases": {
+    "states": ["start", "concentric", "peak_contraction", "eccentric", "rest"],
+    "transitions": [
+      {
+        "from": "start",
+        "to": "concentric",
+        "condition": "elbow_angle decreasing AND wrist_y decreasing (moving up)",
+        "description": "肘角减小，手腕上升"
+      },
+      {
+        "from": "concentric",
+        "to": "peak_contraction",
+        "condition": "elbow_angle reaches minimum AND wrist_y minimum",
+        "description": "到达最高点（最大屈肘）"
+      },
+      {
+        "from": "peak_contraction",
+        "to": "eccentric",
+        "condition": "elbow_angle increasing AND wrist_y increasing",
+        "description": "开始下放"
+      },
+      {
+        "from": "eccentric",
+        "to": "rest",
+        "condition": "elbow_angle > 160 AND stable",
+        "description": "回到起始位"
+      }
+    ],
+    "critical_frames": {
+      "start": "起始帧 → 检测肘部位置（应固定在体侧）",
+      "peak_contraction": "肘角最小帧 → 检测是否充分屈曲",
+      "mid_eccentric": "下放50%处 → 检测离心控制速度"
+    }
+  },
+
+  "key_points": [
+    {
+      "id": "elbow_fixation",
+      "name_zh": "肘部固定",
+      "name_en": "Elbow Fixation",
+      "weight": 0.30,
+      "measure": {
+        "method": "elbow_position_stability",
+        "points": ["elbow"],
+        "at_phase": ["concentric", "eccentric"],
+        "rule": "肘部应固定在体侧，不应前后移动或上抬"
+      },
+      "scoring": {
+        "excellent": "肘部几乎不动（位移 < 5%身高）",
+        "good": "轻微移动 5-10%",
+        "poor": "肘部明显前移或上抬 > 15%"
+      },
+      "score_map": {
+        "movement_under_5pct": 100,
+        "movement_5_to_10pct": 78,
+        "movement_10_to_15pct": 55,
+        "movement_over_15pct": 25
+      }
+    },
+    {
+      "id": "shoulder_swing",
+      "name_zh": "肩部代偿",
+      "name_en": "Shoulder Swing (Cheating)",
+      "weight": 0.25,
+      "measure": {
+        "method": "shoulder_y_and_torso_angle",
+        "points": ["shoulder", "torso"],
+        "at_phase": "concentric",
+        "rule": "肩膀不应前后摇晃或后仰借力"
+      },
+      "scoring": {
+        "excellent": "躯干稳定，肩部无代偿",
+        "good": "轻微身体晃动",
+        "poor": "明显后仰或甩臂借力"
+      },
+      "score_map": {
+        "no_swing": 100,
+        "minor_sway": 75,
+        "moderate_lean": 50,
+        "heavy_cheating": 20
+      }
+    },
+    {
+      "id": "full_rom",
+      "name_zh": "完整幅度",
+      "name_en": "Full Range of Motion",
+      "weight": 0.20,
+      "measure": {
+        "method": "elbow_angle_range",
+        "points": ["elbow_angle"],
+        "at_phase": "full_rep",
+        "rule": "应从完全伸直（~170°）弯举到完全屈曲（~30°）"
+      },
+      "scoring": {
+        "excellent": "ROM > 130°（从170°到40°）",
+        "good": "ROM 100-130°",
+        "poor": "ROM < 80°（半程弯举）"
+      },
+      "score_map": {
+        "rom_over_130": 100,
+        "rom_100_to_130": 78,
+        "rom_80_to_100": 55,
+        "rom_under_80": 25
+      }
+    },
+    {
+      "id": "eccentric_control",
+      "name_zh": "离心控制",
+      "name_en": "Eccentric Control",
+      "weight": 0.15,
+      "measure": {
+        "method": "eccentric_duration_vs_concentric",
+        "at_phase": "eccentric",
+        "rule": "下放时间应 ≥ 推起时间，理想比率 1.0-2.5"
+      },
+      "scoring": {
+        "excellent": "离心/向心比率 1.2-2.5（有控制下放）",
+        "good": "比率 0.8-1.2",
+        "poor": "比率 < 0.5（快速丢下）"
+      },
+      "score_map": {
+        "ratio_1.2_to_2.5": 100,
+        "ratio_0.8_to_1.2": 78,
+        "ratio_0.5_to_0.8": 55,
+        "ratio_under_0.5": 25
+      }
+    },
+    {
+      "id": "wrist_control",
+      "name_zh": "手腕控制",
+      "name_en": "Wrist Control",
+      "weight": 0.10,
+      "measure": {
+        "method": "wrist_angle_stability",
+        "points": ["wrist"],
+        "at_phase": ["concentric", "peak", "eccentric"],
+        "rule": "手腕应保持中立或轻微旋后，不应过度屈曲"
+      },
+      "scoring": {
+        "excellent": "手腕全程中立",
+        "good": "轻微变化",
+        "poor": "手腕过度屈曲或甩腕"
+      },
+      "score_map": {
+        "neutral_throughout": 100,
+        "minor_variation": 80,
+        "wrist_curling": 50,
+        "wrist_flailing": 25
+      }
+    }
+  ],
+
+  "errors": [
+    {
+      "id": "curl_elbow_drift",
+      "name_zh": "肘部前移/上抬",
+      "name_en": "Elbow Drift Forward/Up",
+      "severity": "medium",
+      "injury_risk": ["三角肌前束代偿", "肱二头肌刺激减少"],
+      "detect": {
+        "method": "elbow_y_change",
+        "condition": "elbow_y changes > body_height * 0.08 during rep",
+        "phase": "concentric",
+        "min_frames": 5
+      },
+      "severity_levels": {
+        "minor": { "threshold": "移动 8-12%身高", "score_penalty": -8 },
+        "moderate": { "threshold": "移动 12-18%", "score_penalty": -18 },
+        "severe": { "threshold": "移动 > 18%", "score_penalty": -30 }
+      },
+      "feedback_zh": "⚠️ 肘部前移/上抬：弯举时肘部应固定在体侧。肘部上抬会让三角肌前束代偿，减少肱二头肌刺激。想象肘部被钉在肋骨两侧。",
+      "fix_exercises": ["靠墙弯举", "牧师凳弯举", "降低重量"]
+    },
+    {
+      "id": "curl_body_swing",
+      "name_zh": "身体甩动借力",
+      "name_en": "Body Swing (Cheating)",
+      "severity": "medium",
+      "injury_risk": ["腰椎压力", "训练效果降低"],
+      "detect": {
+        "method": "torso_angle_oscillation",
+        "condition": "torso_from_vertical oscillation > 10° during rep",
+        "phase": "concentric",
+        "min_frames": 5
+      },
+      "severity_levels": {
+        "minor": { "threshold": "晃动 8-15°", "score_penalty": -10 },
+        "moderate": { "threshold": "晃动 15-25°", "score_penalty": -22 },
+        "severe": { "threshold": "晃动 > 25°", "score_penalty": -35 }
+      },
+      "feedback_zh": "⚠️ 身体甩动借力：弯举时身体前后晃动说明重量过大。降低重量，保持躯干完全稳定，只用手臂发力。",
+      "fix_exercises": ["坐姿弯举", "靠墙弯举", "降低重量30%"]
+    },
+    {
+      "id": "curl_half_rom",
+      "name_zh": "半程弯举",
+      "name_en": "Half Range of Motion",
+      "severity": "low",
+      "injury_risk": ["肌力发展不均衡"],
+      "detect": {
+        "method": "elbow_angle_range",
+        "condition": "max_elbow - min_elbow < 80",
+        "phase": "full_rep",
+        "min_frames": 1
+      },
+      "severity_levels": {
+        "minor": { "threshold": "ROM 80-100°", "score_penalty": -8 },
+        "moderate": { "threshold": "ROM 50-80°", "score_penalty": -18 },
+        "severe": { "threshold": "ROM < 50°", "score_penalty": -30 }
+      },
+      "feedback_zh": "⚠️ 动作幅度不足：应从手臂完全伸直弯举到完全屈曲。全程控制才能获得完整的肌肉刺激。",
+      "fix_exercises": ["降低重量", "21s弯举法", "全程Incline Curl"]
+    },
+    {
+      "id": "curl_fast_eccentric",
+      "name_zh": "离心过快（丢放）",
+      "name_en": "Fast Eccentric (Dropping)",
+      "severity": "low",
+      "injury_risk": ["肌腱损伤风险", "失去离心训练效果"],
+      "detect": {
+        "method": "eccentric_vs_concentric_time",
+        "condition": "eccentric_duration < concentric_duration * 0.5",
+        "phase": "eccentric",
+        "min_frames": 1
+      },
+      "severity_levels": {
+        "minor": { "threshold": "比率 0.3-0.5", "score_penalty": -5 },
+        "moderate": { "threshold": "比率 0.15-0.3", "score_penalty": -12 },
+        "severe": { "threshold": "比率 < 0.15（几乎丢下）", "score_penalty": -22 }
+      },
+      "feedback_zh": "⚠️ 下放速度过快：离心阶段（下放）对肌肉增长同样重要。用2-3秒控制下放，感受肱二头肌的拉伸。",
+      "fix_exercises": ["3秒离心弯举", "降低重量", "Negative Rep训练"]
+    },
+    {
+      "id": "curl_wrist_curl",
+      "name_zh": "手腕甩动/卷腕",
+      "name_en": "Wrist Curling at Top",
+      "severity": "low",
+      "injury_risk": ["腕关节压力", "前臂代偿"],
+      "detect": {
+        "method": "wrist_position_change",
+        "condition": "wrist flexion at peak contraction",
+        "phase": "peak_contraction",
+        "min_frames": 3
+      },
+      "severity_levels": {
+        "minor": { "threshold": "轻微卷腕", "score_penalty": -5 },
+        "moderate": { "threshold": "明显卷腕", "score_penalty": -12 },
+        "severe": { "threshold": "严重卷腕", "score_penalty": -20 }
+      },
+      "feedback_zh": "⚠️ 顶峰卷腕：弯举到最高点时手腕向前卷曲，用前臂代偿了肱二头肌的发力。保持手腕中立位。",
+      "fix_exercises": ["锤式弯举", "降低重量", "关注手腕中立位"]
+    }
+  ],
+
+  "rep_detection": {  
+      "primary_angle": "elbow_angle_avg",
+      "min_rom": 50,
+      "min_duration": 0.5,
+      "max_duration": 6.0
+  },
+
+  "feedback_rules": {
+    "excellent": {
+      "condition": "total_score >= 90",
+      "zh": "🏆 弯举技术完美！肘部固定、全程控制、节奏稳定。{rep_count}次质量一致。",
+      "en": "Perfect curl form! Fixed elbows, full control, steady tempo."
+    },
+    "good": {
+      "condition": "total_score >= 75",
+      "zh": "👍 弯举整体不错。{top_error}",
+      "en": "Good curls overall. {top_error}"
+    },
+    "needs_work": {
+      "condition": "total_score >= 60",
+      "zh": "🔧 弯举需要改进：{top_error}，{second_error}",
+      "en": "Curls need improvement: {top_error}, {second_error}"
+    },
+    "poor": {
+      "condition": "total_score < 60",
+      "zh": "⛔ 弯举借力过多，训练效果大打折扣：{top_error}。降低重量，专注肌肉收缩感。",
+      "en": "Too much cheating: {top_error}. Reduce weight, focus on contraction."
+    }
+  }
+}

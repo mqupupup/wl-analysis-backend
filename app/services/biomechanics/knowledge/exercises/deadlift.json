@@ -1,0 +1,317 @@
+{
+  "meta": {
+    "id": "deadlift",
+    "name_en": "Conventional Deadlift",
+    "name_zh": "传统硬拉",
+    "motion_chain": "lower_body",
+    "pattern": "hinge",
+    "primary_joints": ["hip", "knee", "spine"],
+    "primary_muscles": ["臀大肌", "腘绳肌", "竖脊肌", "背阔肌"],
+    "equipment": ["barbell"],
+    "typical_rom": {
+      "hip_angle": { "min": 30, "max": 180 },
+      "knee_angle": { "min": 70, "max": 180 }
+    }
+  },
+
+  "phases": {
+    "states": ["setup", "first_pull", "transition", "second_pull", "lockout", "eccentric", "rest"],
+    "transitions": [
+      {
+        "from": "setup",
+        "to": "first_pull",
+        "condition": "bar_y decreasing (off ground) AND knee_angle > setup + 5",
+        "description": "杠铃离地，膝盖开始伸展"
+      },
+      {
+        "from": "first_pull",
+        "to": "transition",
+        "condition": "bar_y ≈ knee_height",
+        "description": "杠铃过膝"
+      },
+      {
+        "from": "transition",
+        "to": "second_pull",
+        "condition": "hip_angle increasing rapidly",
+        "description": "髋部发力推髋"
+      },
+      {
+        "from": "second_pull",
+        "to": "lockout",
+        "condition": "hip_angle > 170 AND knee_angle > 170",
+        "description": "髋膝完全伸展"
+      },
+      {
+        "from": "lockout",
+        "to": "eccentric",
+        "condition": "bar_y decreasing",
+        "description": "下放杠铃"
+      },
+      {
+        "from": "eccentric",
+        "to": "rest",
+        "condition": "bar_y ≈ floor AND stable_for > 0.5s",
+        "description": "杠铃落地"
+      }
+    ],
+    "critical_frames": {
+      "setup": "起手姿势帧 → 检测髋高度、脊柱角度、肩与杠铃相对位置",
+      "first_pull": "杠铃过膝前 → 检测脊柱中立位、杠铃是否贴腿",
+      "lockout": "完全站立帧 → 检测是否过伸、臀部是否收紧"
+    }
+  },
+
+  "key_points": [
+    {
+      "id": "spine_neutrality",
+      "name_zh": "脊柱中立位",
+      "name_en": "Spine Neutrality",
+      "weight": 0.30,
+      "measure": {
+        "method": "torso_straightness",
+        "points": ["shoulder", "hip"],
+        "at_phase": ["setup", "first_pull", "transition"],
+        "rule": "躯干应保持近似直线，不应出现明显弯曲"
+      },
+      "scoring": {
+        "excellent": "脊柱全程中立，无弯曲",
+        "good": "轻微胸椎弯曲 < 5°",
+        "poor": "腰椎弯曲 > 10°（圆背）"
+      },
+      "score_map": {
+        "neutral_throughout": 100,
+        "minor_thoracic_flex": 80,
+        "moderate_lumbar_flex": 45,
+        "severe_rounding": 15
+      }
+    },
+    {
+      "id": "hip_height",
+      "name_zh": "起手髋高度",
+      "name_en": "Setup Hip Height",
+      "weight": 0.20,
+      "measure": {
+        "method": "hip_y_relative_to_shoulder_knee",
+        "points": ["hip", "shoulder", "knee"],
+        "at_phase": "setup",
+        "rule": "髋应在肩和膝之间，不应过高（变成直腿硬拉）或过低（变成深蹲）"
+      },
+      "scoring": {
+        "excellent": "髋高度合理，肩在杠铃正上方或略前",
+        "good": "髋略高或略低",
+        "poor": "髋过高（>肩高度）或过低（<膝高度）"
+      },
+      "score_map": {
+        "ideal_hip_height": 100,
+        "slightly_high_or_low": 75,
+        "too_high": 50,
+        "too_low": 50
+      }
+    },
+    {
+      "id": "bar_proximity",
+      "name_zh": "杠铃贴身程度",
+      "name_en": "Bar Proximity to Body",
+      "weight": 0.20,
+      "measure": {
+        "method": "wrist_x_distance_to_hip",
+        "points": ["wrist_midpoint", "hip"],
+        "at_phase": ["first_pull", "transition", "second_pull"],
+        "rule": "杠铃应尽量贴近身体（沿腿面上升）"
+      },
+      "scoring": {
+        "excellent": "杠铃始终贴腿（距离 < 5%身高）",
+        "good": "距离 5-10%",
+        "poor": "距离 > 15%（杠铃远离身体）"
+      },
+      "score_map": {
+        "distance_under_5pct": 100,
+        "distance_5_to_10pct": 80,
+        "distance_10_to_15pct": 55,
+        "distance_over_15pct": 25
+      }
+    },
+    {
+      "id": "lockout_quality",
+      "name_zh": "锁死质量",
+      "name_en": "Lockout Quality",
+      "weight": 0.15,
+      "measure": {
+        "method": "hip_knee_extension_at_phase",
+        "points": ["hip_angle", "knee_angle"],
+        "at_phase": "lockout",
+        "rule": "髋膝完全伸展但不超伸"
+      },
+      "scoring": {
+        "excellent": "髋膝完全伸展，不过伸，臀部收紧",
+        "good": "接近完全伸展",
+        "poor": "过度后仰或髋未完全伸展"
+      },
+      "score_map": {
+        "clean_lockout": 100,
+        "near_complete": 80,
+        "incomplete": 50,
+        "hyperextension": 30
+      }
+    },
+    {
+      "id": "tempo_control",
+      "name_zh": "节奏控制",
+      "name_en": "Tempo Control",
+      "weight": 0.15,
+      "measure": {
+        "method": "phase_duration",
+        "ideal": { "first_pull": "0.8-2.0s", "lockout_hold": "0.3-1.0s", "eccentric": "1.0-3.0s" }
+      },
+      "scoring": {
+        "excellent": "拉起有控制 + 锁死停顿 + 下放有控制",
+        "good": "节奏合理",
+        "poor": "猛拉/快速下放/不控制离心"
+      },
+      "score_map": {
+        "controlled_throughout": 100,
+        "acceptable": 75,
+        "jerky_pull": 45,
+        "drop_no_control": 25
+      }
+    }
+  ],
+
+  "errors": [
+    {
+      "id": "deadlift_lumbar_rounding",
+      "name_zh": "腰椎弯曲（圆背）",
+      "name_en": "Lumbar Rounding",
+      "severity": "critical",
+      "injury_risk": ["腰椎间盘突出", "竖脊肌拉伤", "长期脊柱损伤"],
+      "detect": {
+        "method": "torso_angle_change",
+        "condition": "spine flexion > 15° from setup position",
+        "phase": ["first_pull", "transition"],
+        "min_frames": 5
+      },
+      "severity_levels": {
+        "minor": { "threshold": "弯曲 10-15°", "score_penalty": -15 },
+        "moderate": { "threshold": "弯曲 15-25°", "score_penalty": -30 },
+        "severe": { "threshold": "弯曲 > 25°", "score_penalty": -50 }
+      },
+      "feedback_zh": "🚨 腰椎弯曲（危险）：拉起过程中下背出现明显弯曲，这是硬拉最危险的动作错误。立即降低重量，重新学习髋铰链模式，确保拉起前收紧背阔肌和核心。",
+      "fix_exercises": ["降低重量", "罗马尼亚硬拉（学髋铰链）", "Good Morning（轻重量）", "Bird Dog核心训练"]
+    },
+    {
+      "id": "deadlift_hip_shoot_up",
+      "name_zh": "臀部先抬起",
+      "name_en": "Hips Shooting Up",
+      "severity": "medium",
+      "injury_risk": ["变成直腿硬拉", "腰椎剪切力增加"],
+      "detect": {
+        "method": "hip_vs_shoulder_rise",
+        "condition": "hip rises faster than shoulder in first_pull (ratio > 2:1)",
+        "phase": "first_pull",
+        "min_frames": 5
+      },
+      "severity_levels": {
+        "minor": { "threshold": "比率 1.5-2.0", "score_penalty": -8 },
+        "moderate": { "threshold": "比率 2.0-3.0", "score_penalty": -18 },
+        "severe": { "threshold": "比率 > 3.0", "score_penalty": -30 }
+      },
+      "feedback_zh": "⚠️ 起手时臀部先抬起：髋部和肩部应同步上升。想象用脚推地板（leg press the floor），而不是用背拉杠铃。",
+      "fix_exercises": ["Deficit Deadlift", "暂停硬拉（地面1寸暂停）", "降低起手髋位"]
+    },
+    {
+      "id": "deadlift_bar_away",
+      "name_zh": "杠铃远离身体",
+      "name_en": "Bar Away from Body",
+      "severity": "medium",
+      "injury_risk": ["腰椎力矩增大", "下背过劳"],
+      "detect": {
+        "method": "wrist_hip_distance",
+        "condition": "horizontal distance > body_height * 0.12",
+        "phase": ["first_pull", "transition"],
+        "min_frames": 5
+      },
+      "severity_levels": {
+        "minor": { "threshold": "距离 10-15%身高", "score_penalty": -8 },
+        "moderate": { "threshold": "距离 15-20%", "score_penalty": -18 },
+        "severe": { "threshold": "距离 > 20%", "score_penalty": -30 }
+      },
+      "feedback_zh": "⚠️ 杠铃远离身体：拉起时杠铃应贴着腿面上升。尝试'刮腿'拉起，并用背阔肌将杠铃拉向身体。",
+      "fix_exercises": ["拉起时想象刮腿", "背阔肌激活训练", "罗马尼亚硬拉"]
+    },
+    {
+      "id": "deadlift_hyperextension",
+      "name_zh": "锁死过度后仰",
+      "name_en": "Lockout Hyperextension",
+      "severity": "low",
+      "injury_risk": ["腰椎过伸", "不必要压力"],
+      "detect": {
+        "method": "torso_past_vertical",
+        "condition": "torso lean back > 10°",
+        "phase": "lockout",
+        "min_frames": 3
+      },
+      "severity_levels": {
+        "minor": { "threshold": "后仰 5-10°", "score_penalty": -5 },
+        "moderate": { "threshold": "后仰 10-20°", "score_penalty": -12 },
+        "severe": { "threshold": "后仰 > 20°", "score_penalty": -20 }
+      },
+      "feedback_zh": "⚠️ 锁死时过度后仰：站直即可，不需要向后仰。收紧臀部站直就是正确的锁死姿势。",
+      "fix_exercises": ["减少锁死幅度", "臀部收紧训练"]
+    },
+    {
+      "id": "deadlift_jerk_off_floor",
+      "name_zh": "猛拉离地",
+      "name_en": "Jerking Off the Floor",
+      "severity": "medium",
+      "injury_risk": ["失去张力", "腰椎突然受力"],
+      "detect": {
+        "method": "acceleration_spike",
+        "condition": "bar acceleration spike > 3x average at start",
+        "phase": "first_pull_start",
+        "min_frames": 3
+      },
+      "severity_levels": {
+        "minor": { "threshold": "加速比 2-3x", "score_penalty": -8 },
+        "moderate": { "threshold": "加速比 3-5x", "score_penalty": -18 },
+        "severe": { "threshold": "加速比 > 5x", "score_penalty": -30 }
+      },
+      "feedback_zh": "⚠️ 猛拉离地：起手用爆发力猛拉会导致失去张力。应先'拉出杠铃的松弛'（pull the slack out），感受到全身张力后再发力拉起。",
+      "fix_exercises": ["Pause Deadlift", "Romanian Deadlift", "降低重量学控制"]
+    }
+  ],
+
+  "rep_detection": {
+    "primary_angle": "hip_angle",
+    "secondary_angle": "knee_angle",
+    "peak_type": "maxima",
+    "valley_type": "minima",
+    "min_rom": 50,
+    "min_duration": 1.2,
+    "max_duration": 12.0,
+    "lockout_threshold": 170,
+    "floor_threshold": 60
+  },
+
+  "feedback_rules": {
+    "excellent": {
+      "condition": "total_score >= 90",
+      "zh": "🏆 硬拉技术优秀！脊柱控制稳定，杠铃轨迹贴身。{rep_count}次质量一致。",
+      "en": "Excellent deadlift technique! Stable spine, bar close to body."
+    },
+    "good": {
+      "condition": "total_score >= 75",
+      "zh": "👍 硬拉整体不错。{top_error}",
+      "en": "Good deadlift overall. {top_error}"
+    },
+    "needs_work": {
+      "condition": "total_score >= 60",
+      "zh": "🔧 硬拉需要注意：{top_error}，{second_error}",
+      "en": "Deadlift needs attention: {top_error}, {second_error}"
+    },
+    "poor": {
+      "condition": "total_score < 60",
+      "zh": "🚨 硬拉存在严重安全风险：{top_error}。强烈建议降低重量，重新学习动作模式。",
+      "en": "Critical safety issue: {top_error}. Strongly recommend reducing weight."
+    }
+  }
+}

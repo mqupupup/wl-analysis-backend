@@ -1,0 +1,321 @@
+{
+  "meta": {
+    "id": "squat",
+    "name_en": "Barbell Back Squat",
+    "name_zh": "杠铃深蹲",
+    "motion_chain": "lower_body",
+    "pattern": "squat",
+    "primary_joints": ["knee", "hip", "ankle"],
+    "primary_muscles": ["股四头肌", "臀大肌", "竖脊肌"],
+    "equipment": ["barbell"],
+    "typical_rom": {
+      "knee_angle": { "min": 50, "max": 140 },
+      "hip_angle": { "min": 30, "max": 120 }
+    }
+  },
+
+  "phases": {
+    "states": ["setup", "eccentric", "bottom", "concentric", "lockout", "rest"],
+    "transitions": [
+      {
+        "from": "setup",
+        "to": "eccentric",
+        "condition": "knee_angle decreasing AND knee_angle < 160",
+        "description": "膝盖开始弯曲，进入下降阶段"
+      },
+      {
+        "from": "eccentric",
+        "to": "bottom",
+        "condition": "knee_angle < 95 AND knee_angle increasing_next_frame",
+        "description": "到达最低点"
+      },
+      {
+        "from": "bottom",
+        "to": "concentric",
+        "condition": "knee_angle increasing AND knee_angle > bottom_angle + 5",
+        "description": "膝盖开始伸展，进入上升阶段"
+      },
+      {
+        "from": "concentric",
+        "to": "lockout",
+        "condition": "knee_angle > 165",
+        "description": "膝盖接近完全伸展"
+      },
+      {
+        "from": "lockout",
+        "to": "rest",
+        "condition": "stable_for > 0.5s",
+        "description": "站立稳定"
+      },
+      {
+        "from": "rest",
+        "to": "setup",
+        "condition": "knee_angle < 170 AND preparing",
+        "description": "准备下一次"
+      }
+    ],
+    "critical_frames": {
+      "bottom": "膝盖角最小值帧 → 检测深度 + 膝盖位置",
+      "mid_concentric": "膝盖角 = (bottom + lockout) / 2 → 检测速度 + 躯干角",
+      "lockout": "膝盖角最大值帧 → 检测锁死姿势"
+    }
+  },
+
+  "key_points": [
+    {
+      "id": "depth",
+      "name_zh": "下蹲深度",
+      "name_en": "Depth",
+      "weight": 0.25,
+      "measure": {
+        "method": "compare_y",
+        "points": ["hip", "knee"],
+        "at_phase": "bottom"
+      },
+      "scoring": {
+        "excellent": "hip_y < knee_y (髋低于膝)",
+        "good": "hip_y ≈ knee_y ± 5% (髋膝同高)",
+        "poor": "hip_y > knee_y + 10% (明显高于膝)"
+      },
+      "score_map": {
+        "hip_below_knee": 100,
+        "hip_parallel_knee": 85,
+        "hip_above_knee_5pct": 65,
+        "hip_above_knee_10pct": 40,
+        "quarter_squat": 20
+      }
+    },
+    {
+      "id": "knee_tracking",
+      "name_zh": "膝盖轨迹",
+      "name_en": "Knee Tracking",
+      "weight": 0.25,
+      "measure": {
+        "method": "compare_x",
+        "points": ["knee", "ankle"],
+        "at_phase": ["eccentric", "bottom", "concentric"],
+        "rule": "knee_x should align with ankle_x (同侧)"
+      },
+      "scoring": {
+        "excellent": "膝盖始终在脚踝正上方或外侧",
+        "good": "膝盖轻微内偏 < 5%肩宽",
+        "poor": "膝盖内扣超过脚踝内侧 (valgus)"
+      },
+      "score_map": {
+        "knee_outside_ankle": 100,
+        "knee_aligned_ankle": 90,
+        "knee_inside_ankle_3pct": 70,
+        "knee_inside_ankle_8pct": 45,
+        "severe_valgus": 20
+      }
+    },
+    {
+      "id": "torso_control",
+      "name_zh": "躯干控制",
+      "name_en": "Torso Control",
+      "weight": 0.20,
+      "measure": {
+        "method": "angle",
+        "points": ["shoulder", "hip"],
+        "reference": "vertical",
+        "at_phase": "bottom"
+      },
+      "scoring": {
+        "excellent": "躯干前倾 < 30°（高杠）或 < 45°（低杠）",
+        "good": "躯干前倾 30°-40°",
+        "poor": "躯干前倾 > 50° 或 '早安式深蹲'"
+      },
+      "score_map": {
+        "torso_under_30": 100,
+        "torso_30_to_40": 85,
+        "torso_40_to_50": 65,
+        "torso_over_50": 35
+      }
+    },
+    {
+      "id": "hip_drive",
+      "name_zh": "髋部驱动",
+      "name_en": "Hip Drive",
+      "weight": 0.15,
+      "measure": {
+        "method": "velocity_comparison",
+        "points": ["hip", "shoulder"],
+        "at_phase": "concentric_first_30pct",
+        "rule": "hip和shoulder应同步上升"
+      },
+      "scoring": {
+        "excellent": "髋和肩同步上升，hip_y速度/shoulder_y速度 ≈ 1.0",
+        "good": "比率 0.7-1.3",
+        "poor": "比率 < 0.5 (屁股先翘) 或 > 1.5 (shoot through)"
+      },
+      "score_map": {
+        "ratio_0.9_to_1.1": 100,
+        "ratio_0.7_to_1.3": 80,
+        "ratio_0.5_to_0.7_or_1.3_to_1.5": 60,
+        "ratio_outside": 30
+      }
+    },
+    {
+      "id": "bar_path",
+      "name_zh": "杠铃轨迹",
+      "name_en": "Bar Path",
+      "weight": 0.15,
+      "measure": {
+        "method": "midpoint_x_std",
+        "points": ["left_wrist", "right_wrist"],
+        "at_phase": ["eccentric", "concentric"],
+        "reference": "midfoot_x"
+      },
+      "scoring": {
+        "excellent": "杠铃始终在足中上方 ±3%",
+        "good": "偏移 < 8%",
+        "poor": "偏移 > 15%"
+      },
+      "score_map": {
+        "std_under_3pct": 100,
+        "std_3_to_8pct": 80,
+        "std_8_to_15pct": 55,
+        "std_over_15pct": 25
+      }
+    }
+  ],
+
+  "errors": [
+    {
+      "id": "squat_knee_valgus",
+      "name_zh": "膝盖内扣",
+      "name_en": "Knee Valgus",
+      "severity": "high",
+      "injury_risk": ["ACL撕裂", "半月板损伤", "髌骨疼痛"],
+      "detect": {
+        "method": "compare_x_at_phase",
+        "condition": "knee_x < ankle_x - shoulder_width * 0.05",
+        "phase": ["eccentric", "bottom", "concentric"],
+        "min_frames": 3,
+        "confidence_threshold": 0.7
+      },
+      "severity_levels": {
+        "minor": { "threshold": "内偏 5%-10% 肩宽", "score_penalty": -10 },
+        "moderate": { "threshold": "内偏 10%-20% 肩宽", "score_penalty": -25 },
+        "severe": { "threshold": "内偏 > 20% 肩宽", "score_penalty": -40 }
+      },
+      "feedback_zh": "⚠️ 膝盖内扣（{severity}）：下降和起身时膝盖向内侧偏移。建议加强臀中肌训练（弹力带侧步走），下蹲时主动将膝盖向脚尖方向推开。",
+      "feedback_en": "Knee valgus detected ({severity}). Strengthen glute medius and actively push knees over toes.",
+      "fix_exercises": ["弹力带侧步走", "高脚杯深蹲", "单腿臀桥"]
+    },
+    {
+      "id": "squat_insufficient_depth",
+      "name_zh": "深度不足",
+      "name_en": "Insufficient Depth",
+      "severity": "medium",
+      "injury_risk": ["肌力发展不均衡", "功能性受限"],
+      "detect": {
+        "method": "compare_y_at_phase",
+        "condition": "hip_y > knee_y",
+        "phase": "bottom",
+        "min_frames": 1
+      },
+      "severity_levels": {
+        "minor": { "threshold": "髋比膝高 0-5%", "score_penalty": -5 },
+        "moderate": { "threshold": "髋比膝高 5-15%", "score_penalty": -15 },
+        "severe": { "threshold": "半蹲 (髋远高于膝)", "score_penalty": -30 }
+      },
+      "feedback_zh": "⚠️ 下蹲深度不足：最低点时髋关节高于膝关节。尝试降低重量，增加踝关节灵活性和髋关节活动度训练。",
+      "fix_exercises": ["踝关节灵活性训练", "高脚杯深蹲到底部暂停", "90/90髋关节拉伸"]
+    },
+    {
+      "id": "squat_good_morning",
+      "name_zh": "早安式深蹲（躯干过度前倾）",
+      "name_en": "Good Morning Squat",
+      "severity": "high",
+      "injury_risk": ["腰椎剪切力过大", "竖脊肌拉伤"],
+      "detect": {
+        "method": "angle_at_phase",
+        "condition": "torso_from_vertical > 50",
+        "phase": "concentric_first_half",
+        "min_frames": 5
+      },
+      "severity_levels": {
+        "minor": { "threshold": "躯干前倾 40-50°", "score_penalty": -10 },
+        "moderate": { "threshold": "躯干前倾 50-60°", "score_penalty": -20 },
+        "severe": { "threshold": "躯干前倾 > 60°", "score_penalty": -35 }
+      },
+      "feedback_zh": "⚠️ 起身时躯干过度前倾（早安式）：臀部先抬起而胸部没跟上。建议加强股四头肌（前蹲/腿举），起身时有意识地'挺胸向上'。",
+      "fix_exercises": ["前蹲", "暂停深蹲", "腿举"]
+    },
+    {
+      "id": "squat_lumbar_rounding",
+      "name_zh": "腰椎弯曲（屁股眨眼）",
+      "name_en": "Butt Wink / Lumbar Flexion",
+      "severity": "high",
+      "injury_risk": ["腰椎间盘压力", "下背痛"],
+      "detect": {
+        "method": "angle_change_at_phase",
+        "condition": "hip_hinge_angle change > 15° at bottom",
+        "phase": "bottom",
+        "min_frames": 3
+      },
+      "severity_levels": {
+        "minor": { "threshold": "角度变化 10-15°", "score_penalty": -10 },
+        "moderate": { "threshold": "角度变化 15-25°", "score_penalty": -20 },
+        "severe": { "threshold": "角度变化 > 25°", "score_penalty": -35 }
+      },
+      "feedback_zh": "⚠️ 底部腰椎弯曲（Butt Wink）：骨盆在最低点后倾，导致腰椎失去中立位。检查踝关节背屈活动度，适当加宽站距或穿举重鞋。",
+      "fix_exercises": ["踝关节背屈拉伸", "猫牛式", "暂停深蹲（高于眨眼点）"]
+    },
+    {
+      "id": "squat_bar_drift",
+      "name_zh": "杠铃轨迹偏移",
+      "name_en": "Bar Path Drift",
+      "severity": "medium",
+      "injury_risk": ["重心失衡", "腰椎代偿"],
+      "detect": {
+        "method": "midpoint_x_deviation",
+        "condition": "wrist_midpoint_x deviation from midfoot > 10%",
+        "phase": ["eccentric", "concentric"],
+        "min_frames": 5
+      },
+      "severity_levels": {
+        "minor": { "threshold": "偏移 8-12%", "score_penalty": -8 },
+        "moderate": { "threshold": "偏移 12-20%", "score_penalty": -18 },
+        "severe": { "threshold": "偏移 > 20%", "score_penalty": -30 }
+      },
+      "feedback_zh": "⚠️ 杠铃轨迹前后偏移较大：理想轨迹应保持在足中上方。下降时注意重心均匀分布在全脚掌。",
+      "fix_exercises": ["暂停深蹲", "赤脚深蹲（感受重心）", "Tempo深蹲"]
+    }
+  ],
+
+  "rep_detection": {
+    "primary_angle": "knee_angle_avg",
+    "peak_type": "maxima",
+    "valley_type": "minima",
+    "min_rom": 30,
+    "min_duration": 0.8,
+    "max_duration": 8.0,
+    "lockout_threshold": 165,
+    "bottom_threshold": 95
+  },
+
+  "feedback_rules": {
+    "excellent": {
+      "condition": "total_score >= 90",
+      "zh": "🏆 深蹲技术非常好！{rep_count}次动作质量稳定，继续保持。",
+      "en": "Excellent squat form! {rep_count} reps with consistent quality."
+    },
+    "good": {
+      "condition": "total_score >= 75",
+      "zh": "👍 深蹲整体不错。{top_error}",
+      "en": "Good squat overall. {top_error}"
+    },
+    "needs_work": {
+      "condition": "total_score >= 60",
+      "zh": "🔧 深蹲需要改进。主要问题：{top_error}，{second_error}",
+      "en": "Squat needs improvement. Main issues: {top_error}, {second_error}"
+    },
+    "poor": {
+      "condition": "total_score < 60",
+      "zh": "⛔ 建议降低重量重新审视动作模式。关键问题：{top_error}",
+      "en": "Reduce weight and review movement pattern. Key issue: {top_error}"
+    }
+  }
+}

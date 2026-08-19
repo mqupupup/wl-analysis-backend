@@ -1,0 +1,864 @@
+# backend/app/services/biomechanics/error_detection_engine.py
+"""
+错误检测引擎
+从 knowledge JSON 的 errors 规则驱动逐帧/逐阶段检测
+"""
+
+import re
+import numpy as np
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass, field
+
+PHASE_ALIASES = {
+    "bottom": ["bottom_pause", "bottom", "pause"],
+    "bottom_pause": ["bottom_pause", "bottom", "pause"],
+    "eccentric": ["eccentric", "descent", "lowering"],
+    "concentric": ["concentric", "ascent", "lifting", "press"],
+    "lockout": ["lockout", "top", "finish", "top_pause"],
+    "top": ["top", "top_pause", "lockout", "finish"],
+    "top_pause": ["top_pause", "top", "lockout", "finish"],
+    "setup": ["setup", "start", "ready"],
+    "rest": ["rest", "idle", "recovery"],
+}
+
+# 关键点键名别名
+KEY_ALIASES = {
+    "left_shoulder": ["left_shoulder", "LEFT_SHOULDER", "11", "l_shoulder"],
+    "right_shoulder": ["right_shoulder", "RIGHT_SHOULDER", "12", "r_shoulder"],
+    "left_elbow": ["left_elbow", "LEFT_ELBOW", "13", "l_elbow"],
+    "right_elbow": ["right_elbow", "RIGHT_ELBOW", "14", "r_elbow"],
+    "left_wrist": ["left_wrist", "LEFT_WRIST", "15", "l_wrist"],
+    "right_wrist": ["right_wrist", "RIGHT_WRIST", "16", "r_wrist"],
+    "left_hip": ["left_hip", "LEFT_HIP", "23", "l_hip"],
+    "right_hip": ["right_hip", "RIGHT_HIP", "24", "r_hip"],
+    "left_knee": ["left_knee", "LEFT_KNEE", "25", "l_knee"],
+    "right_knee": ["right_knee", "RIGHT_KNEE", "26", "r_knee"],
+    "left_ankle": ["left_ankle", "LEFT_ANKLE", "27", "l_ankle"],
+    "right_ankle": ["right_ankle", "RIGHT_ANKLE", "28", "r_ankle"],
+}
+
+@dataclass
+class DetectedError:
+    """检测到的单个错误"""
+    error_id: str
+    name_zh: str
+    name_en: str
+    severity: str
+    severity_level: str
+    score_penalty: float
+    start_frame: int
+    end_frame: int
+    duration: float
+    confidence: float
+    feedback_zh: str
+    feedback_en: str
+    fix_exercises: List[str]
+    injury_risk: List[str]
+    metrics: Dict[str, float] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "error_id": self.error_id,
+            "name_zh": self.name_zh,
+            "name_en": self.name_en,
+            "severity": self.severity,
+            "severity_level": self.severity_level,
+            "score_penalty": self.score_penalty,
+            "start_frame": self.start_frame,
+            "end_frame": self.end_frame,
+            "duration": self.duration,
+            "confidence": self.confidence,
+            "feedback_zh": self.feedback_zh,
+            "feedback_en": self.feedback_en,
+            "fix_exercises": self.fix_exercises,
+            "injury_risk": self.injury_risk,
+            "metrics": self.metrics
+        }
+
+
+class ErrorDetectionEngine:
+    """基于知识库的错误检测引擎"""
+
+    def __init__(self, knowledge: Dict[str, Any], fps: float = 30.0):
+        self.knowledge = knowledge
+        self.fps = fps
+        self.error_rules = knowledge.get("errors", [])
+
+    def detect(self, reps: List[Any], frame_data_list: List[Any]) -> List[DetectedError]:
+        """对所有 rep 进行错误检测"""
+        all_errors = []
+
+        for rep in reps:
+            rep_errors = self._detect_rep_errors(rep, frame_data_list)
+            # ✅ 安全设置 errors_detected，兼容 dataclass / namedtuple / 普通对象
+            try:
+                rep.errors_detected = rep_errors
+            except (AttributeError, TypeError):
+                # RepResult 是 dataclass 且没有 errors_detected 字段
+                # 用 object.__setattr__ 强制设置
+                try:
+                    object.__setattr__(rep, 'errors_detected', rep_errors)
+                except Exception:
+                    pass  # 实在不行就跳过，不影响主流程
+            all_errors.extend(rep_errors)
+
+        return all_errors
+
+    def _detect_rep_errors(self, rep: Any, frame_data_list: List[Any]) -> List[DetectedError]:
+        """检测单个 rep 内的所有错误"""
+        errors = []
+        for rule in self.error_rules:
+            try:
+                detected = self._check_error_rule(rule, rep, frame_data_list)
+                if detected:
+                    errors.append(detected)
+            except Exception as e:
+                rule_id = rule.get("id", "unknown")
+                print(f"  [ERR RULE] ⚠️ 规则 '{rule_id}' 执行异常: {e}")
+        return errors
+
+    def _check_error_rule(self, rule: Dict, rep: Any, frame_data_list: List[Any]) -> Optional[DetectedError]:
+        """检查单条错误规则"""
+        detect_config = rule.get("detect", {})
+        method = detect_config.get("method", "")
+        condition = detect_config.get("condition", "")
+        target_phases = detect_config.get("phase", [])
+        min_frames = detect_config.get("min_frames", 1)
+        rule_id = rule.get("id", "unknown")
+        rule_name = rule.get("name_zh", "未知")
+
+        # 获取目标阶段的帧数据
+        target_frames = self._get_frames_for_phases(rep, target_phases, frame_data_list)
+
+        print(f"  [ERR RULE] {rule_id} ({rule_name}): "
+              f"method={method}, phases={target_phases}, "
+              f"frames={len(target_frames)} (min={min_frames})")
+
+        if len(target_frames) < min_frames:
+            print(f"  [ERR RULE] ❌ 帧数不足: {len(target_frames)} < {min_frames}")
+            return None
+
+        # 根据 method 调用不同检测器
+        detector_method = getattr(self, f"_detect_{method}", None)
+        if detector_method:
+            result = detector_method(condition, target_frames, rep, frame_data_list)
+        else:
+            print(f"  [ERR RULE] ⚠️ 未找到检测方法: _detect_{method}，使用通用检测")
+            result = self._detect_generic(condition, target_frames, rep)
+
+        if result is None:
+            print(f"  [ERR RULE] ❌ 检测方法返回 None")
+            return None
+
+        print(f"  [ERR RULE] ✅ 检测到违规: value={result.get('value', 0):.2f}")
+
+        # 判断 severity_level
+        severity_levels = rule.get("severity_levels", {})
+        severity_level, score_penalty = self._determine_severity_level(
+            result.get("value", 0), severity_levels
+        )
+
+        if severity_level is None:
+            print(f"  [ERR RULE] ❌ severity 不满足: value={result.get('value', 0):.2f}")
+            return None
+
+        print(f"  [ERR RULE] ✅ severity={severity_level}, penalty={score_penalty}")
+
+        # 构建反馈
+        feedback_zh = rule.get("feedback_zh", "")
+        feedback_en = rule.get("feedback_en", "")
+        feedback_zh = self._format_feedback(feedback_zh, result, severity_level)
+        feedback_en = self._format_feedback(feedback_en, result, severity_level)
+
+        return DetectedError(
+            error_id=rule.get("id", "unknown"),
+            name_zh=rule.get("name_zh", "未知错误"),
+            name_en=rule.get("name_en", "Unknown Error"),
+            severity=rule.get("severity", "medium"),
+            severity_level=severity_level,
+            score_penalty=score_penalty,
+            start_frame=result.get("start_frame", rep.start_frame),
+            end_frame=result.get("end_frame", rep.end_frame),
+            duration=result.get("duration", 0),
+            confidence=result.get("confidence", 0.8),
+            feedback_zh=feedback_zh,
+            feedback_en=feedback_en,
+            fix_exercises=rule.get("fix_exercises", []),
+            injury_risk=rule.get("injury_risk", []),
+            metrics=result.get("metrics", {})
+        )
+
+    # =========================================================================
+    # 阶段帧提取
+    # =========================================================================
+
+    def _get_frames_for_phases(self, rep: Any, target_phases: List[Any],
+                               frame_data_list: List[Any]) -> List[Tuple[int, Any]]:
+        """获取指定阶段的帧数据"""
+        frames = []
+
+        if isinstance(target_phases, str):
+            target_phases = [target_phases]
+        if not target_phases:
+            for i in range(rep.start_frame, min(rep.end_frame + 1, len(frame_data_list))):
+                frames.append((i, frame_data_list[i]))
+            return frames
+
+        # 构建完整的匹配名称集合
+        all_target_names = set()
+        for tp in target_phases:
+            all_target_names.add(tp)
+            if tp in PHASE_ALIASES:
+                all_target_names.update(PHASE_ALIASES[tp])
+            for key, aliases in PHASE_ALIASES.items():
+                if tp in aliases:
+                    all_target_names.add(key)
+                    all_target_names.update(aliases)
+
+        # 从 rep.phases 中查找匹配的阶段
+        matched = False
+        if hasattr(rep, 'phases') and rep.phases:
+            for phase in rep.phases:
+                phase_name = phase.phase_name if hasattr(phase, 'phase_name') else ""
+                if phase_name in all_target_names:
+                    matched = True
+                    start = phase.start_frame if hasattr(phase, 'start_frame') else rep.start_frame
+                    end = phase.end_frame if hasattr(phase, 'end_frame') else rep.end_frame
+                    for i in range(start, min(end + 1, len(frame_data_list))):
+                        frames.append((i, frame_data_list[i]))
+
+        if not matched:
+            return []
+
+        return frames
+
+    # =========================================================================
+    # severity 判定
+    # =========================================================================
+
+    def _determine_severity_level(self, value: float, severity_levels: Dict) -> Tuple[Optional[str], float]:
+        """根据数值确定严重程度级别"""
+        if not severity_levels:
+            return "moderate", -10
+
+        for level in ["severe", "moderate", "minor"]:
+            if level not in severity_levels:
+                continue
+            level_data = severity_levels[level]
+            threshold_str = str(level_data.get("threshold", ""))
+            penalty = level_data.get("score_penalty", -10)
+            if self._parse_and_check_threshold(value, threshold_str):
+                return level, penalty
+
+        return None, 0
+
+    def _parse_and_check_threshold(self, value: float, threshold_str: str) -> bool:
+        """解析 threshold 并检查"""
+        threshold_str = threshold_str.strip()
+        if not threshold_str:
+            return True
+        try:
+            if " AND " in threshold_str.upper():
+                sub_parts = re.split(r'\s+AND\s+', threshold_str, flags=re.IGNORECASE)
+                return all(self._parse_and_check_threshold(value, p.strip()) for p in sub_parts)
+
+            if "-" in threshold_str and not threshold_str.startswith("<") and not threshold_str.startswith(">"):
+                parts = threshold_str.split("-")
+                if len(parts) == 2:
+                    low = self._extract_number(parts[0])
+                    high = self._extract_number(parts[1])
+                    if low is not None and high is not None:
+                        return low <= value <= high
+
+            for op in [">=", "<=", ">", "<"]:
+                if op in threshold_str:
+                    num_str = threshold_str.split(op, 1)[1].strip()
+                    threshold = self._extract_number(num_str)
+                    if threshold is not None:
+                        if op == ">=": return value >= threshold
+                        elif op == "<=": return value <= threshold
+                        elif op == ">": return value > threshold
+                        elif op == "<": return value < threshold
+
+            threshold = self._extract_number(threshold_str)
+            if threshold is not None:
+                return value > threshold
+            return True
+        except Exception:
+            return True
+
+    def _extract_number(self, s: str) -> Optional[float]:
+        """从字符串中提取数字"""
+        s = s.strip()
+        match = re.match(r'^([+-]?\d+\.?\d*)', s)
+        if match:
+            return float(match.group(1))
+        return None
+
+    def _format_feedback(self, template: str, result: Dict, severity_level: str) -> str:
+        """格式化反馈文案"""
+        try:
+            return template.format(
+                severity=severity_level,
+                angle=result.get("value", 0),
+                value=result.get("value", 0),
+                **result.get("metrics", {})
+            )
+        except Exception:
+            return template
+
+    # =========================================================================
+    # 辅助方法
+    # =========================================================================
+
+    def _get_pos(self, fd: Any, canonical_key: str):
+        """按别名获取关键点坐标"""
+        positions = fd.positions if hasattr(fd, 'positions') else {}
+        for alias in KEY_ALIASES.get(canonical_key, [canonical_key]):
+            v = positions.get(alias)
+            if v is not None:
+                return v
+        return None
+
+    def _get_angle(self, fd: Any, key: str) -> Optional[float]:
+        """从帧数据获取角度（含别名）"""
+        angles = fd.angles if hasattr(fd, 'angles') else {}
+        # 直接查找
+        v = angles.get(key)
+        if v is not None:
+            return v
+        # 别名查找
+        ALIAS_MAP = {
+            "left_elbow": ["left_elbow", "elbow_angle_left"],
+            "right_elbow": ["right_elbow", "elbow_angle_right"],
+            "elbow_angle_avg": ["elbow_angle_avg", "left_elbow", "right_elbow"],
+            "shoulder_flexion_avg": ["shoulder_flexion_avg", "left_shoulder", "right_shoulder"],
+        }
+        for alias in ALIAS_MAP.get(key, []):
+            v = angles.get(alias)
+            if v is not None:
+                return v
+        return None
+
+    def _get_avg_elbow_angle(self, fd: Any) -> Optional[float]:
+        """获取平均肘角"""
+        # 优先用 elbow_angle_avg
+        v = self._get_angle(fd, "elbow_angle_avg")
+        if v is not None:
+            return v
+        le = self._get_angle(fd, "left_elbow")
+        re = self._get_angle(fd, "right_elbow")
+        vals = [x for x in [le, re] if x is not None]
+        return float(np.mean(vals)) if vals else None
+
+    def _get_wrist_mid_y(self, fd: Any) -> Optional[float]:
+        """获取双手腕中点 Y 坐标"""
+        lw = self._get_pos(fd, "left_wrist")
+        rw = self._get_pos(fd, "right_wrist")
+        if lw and rw:
+            return (lw[1] + rw[1]) / 2
+        if lw:
+            return lw[1]
+        if rw:
+            return rw[1]
+        return None
+
+    def _get_shoulder_width(self, fd: Any) -> float:
+        """获取肩宽"""
+        ls = self._get_pos(fd, "left_shoulder")
+        rs = self._get_pos(fd, "right_shoulder")
+        if ls and rs:
+            return abs(ls[0] - rs[0])
+        return 100.0
+
+    def _get_avg_y(self, fd: Any, point: str) -> Optional[float]:
+        """获取左右平均 Y"""
+        left = self._get_pos(fd, f"left_{point}")
+        right = self._get_pos(fd, f"right_{point}")
+        ys = []
+        if left: ys.append(left[1])
+        if right: ys.append(right[1])
+        return float(np.mean(ys)) if ys else None
+
+    def _estimate_body_height(self, fd: Any) -> float:
+        """估算身高"""
+        sy = self._get_avg_y(fd, "shoulder")
+        ay = self._get_avg_y(fd, "ankle")
+        if sy is not None and ay is not None:
+            return abs(ay - sy) * 1.15
+        # 尝试用 hip-knee
+        hy = self._get_avg_y(fd, "hip")
+        ky = self._get_avg_y(fd, "knee")
+        if hy is not None and ky is not None:
+            return abs(ky - hy) * 3.0
+        return 500.0
+
+    # =========================================================================
+    # ✅ 所有检测方法（含新增的 4 个缺失方法）
+    # =========================================================================
+
+    def _detect_min_elbow_angle_at_bottom(self, condition: str, frames: List[Tuple],
+                                          rep: Any, all_frames: List[Any]) -> Optional[Dict]:
+        """
+        ✅ 新增：检测底部最小肘角（动作幅度不足）
+        卧推标准：肘角应降到 90° 以下（杠铃触胸）
+        """
+        min_angles = []
+        for frame_idx, fd in frames:
+            avg = self._get_avg_elbow_angle(fd)
+            if avg is not None:
+                min_angles.append({"frame": frame_idx, "angle": avg})
+
+        if not min_angles:
+            return None
+
+        min_entry = min(min_angles, key=lambda x: x["angle"])
+        min_angle = min_entry["angle"]
+
+        # 最小角度 > 120° 说明幅度不足
+        if min_angle < 120:
+            return None
+
+        deviation = min_angle - 90
+        return {
+            "value": deviation,
+            "start_frame": min_entry["frame"],
+            "end_frame": min_entry["frame"],
+            "duration": 0,
+            "confidence": 0.85,
+            "metrics": {"min_elbow_angle": min_angle, "ideal_angle": 90}
+        }
+
+    def _detect_max_elbow_angle_at_top(self, condition: str, frames: List[Tuple],
+                                       rep: Any, all_frames: List[Any]) -> Optional[Dict]:
+        """
+        ✅ 新增：检测顶部最大肘角（锁定不完整）
+        卧推标准：推起时肘角应接近 170°（完全锁定）
+        """
+        max_angles = []
+        for frame_idx, fd in frames:
+            avg = self._get_avg_elbow_angle(fd)
+            if avg is not None:
+                max_angles.append({"frame": frame_idx, "angle": avg})
+
+        if not max_angles:
+            return None
+
+        max_entry = max(max_angles, key=lambda x: x["angle"])
+        max_angle = max_entry["angle"]
+
+        # 最大角度 > 160° 说明锁定充分
+        if max_angle > 160:
+            return None
+
+        deviation = 170 - max_angle  # 距离完全锁定的差距
+        return {
+            "value": deviation,
+            "start_frame": max_entry["frame"],
+            "end_frame": max_entry["frame"],
+            "duration": 0,
+            "confidence": 0.85,
+            "metrics": {"max_elbow_angle": max_angle, "ideal_angle": 170}
+        }
+
+    def _detect_angle_at_frame(self, condition: str, frames: List[Tuple],
+                               rep: Any, all_frames: List[Any]) -> Optional[Dict]:
+        """
+        ✅ 新增：检测特定帧的角度（通用角度检测）
+        用于肘外展等需要检查特定角度的场景
+        """
+        # 解析 condition: "elbow_tuck_angle > 75" 或 "torso_from_vertical > 50"
+        target_angle, threshold = self._parse_angle_condition(condition)
+        if target_angle is None:
+            # 尝试从 condition 中解析
+            parts = condition.strip().split()
+            if len(parts) >= 3:
+                target_angle = parts[0]
+                try:
+                    threshold = float(parts[-1])
+                except ValueError:
+                    return None
+            else:
+                return None
+
+        violations = []
+        for frame_idx, fd in frames:
+            angle_val = self._get_angle(fd, target_angle)
+            if angle_val is None:
+                continue
+
+            if ">" in condition and angle_val > threshold:
+                violations.append({"frame": frame_idx, "value": angle_val})
+            elif "<" in condition and angle_val < threshold:
+                violations.append({"frame": frame_idx, "value": angle_val})
+            elif angle_val > threshold:  # 默认 >
+                violations.append({"frame": frame_idx, "value": angle_val})
+
+        if not violations:
+            return None
+
+        avg_value = np.mean([v["value"] for v in violations])
+        return {
+            "value": avg_value,
+            "start_frame": violations[0]["frame"],
+            "end_frame": violations[-1]["frame"],
+            "duration": (violations[-1]["frame"] - violations[0]["frame"]) / self.fps,
+            "confidence": min(1.0, len(violations) / 5),
+            "metrics": {"avg_angle": float(avg_value), "threshold": threshold}
+        }
+
+    def _detect_bottom_velocity(self, condition: str, frames: List[Tuple],
+                                rep: Any, all_frames: List[Any]) -> Optional[Dict]:
+        """
+        ✅ 新增：检测底部速度（胸部弹震/砸胸）
+        在底部阶段，如果手腕 Y 坐标突然加速下降，说明杠铃在砸胸
+        """
+        if len(frames) < 5:
+            return None
+
+        wrist_ys = []
+        for frame_idx, fd in frames:
+            wy = self._get_wrist_mid_y(fd)
+            if wy is not None:
+                wrist_ys.append({"frame": frame_idx, "y": wy})
+
+        if len(wrist_ys) < 5:
+            return None
+
+        ys = [w["y"] for w in wrist_ys]
+
+        # 底部暂停检测
+        min_y_idx = int(np.argmin(ys))
+        bottom_start = max(0, min_y_idx - 2)
+        bottom_end = min(len(ys), min_y_idx + 3)
+        bottom_ys = ys[bottom_start:bottom_end]
+
+        if len(bottom_ys) >= 3:
+            bottom_std = np.std(bottom_ys)
+            y_range = max(ys) - min(ys)
+            if y_range > 0:
+                stability_ratio = bottom_std / y_range
+                if stability_ratio < 0.05:
+                    return None  # 底部暂停，不是砸胸
+
+        # 计算速度和加速度
+        velocities = np.diff(ys)
+        accelerations = np.diff(velocities)
+
+        if len(accelerations) == 0:
+            return None
+
+        max_accel = max(accelerations)
+        avg_velocity = np.mean(np.abs(velocities))
+        if avg_velocity == 0:
+            return None
+
+        accel_ratio = max_accel / (avg_velocity + 1e-8) * 100
+
+        if accel_ratio < 50:
+            return None
+
+        return {
+            "value": accel_ratio,
+            "start_frame": wrist_ys[0]["frame"],
+            "end_frame": wrist_ys[-1]["frame"],
+            "duration": (wrist_ys[-1]["frame"] - wrist_ys[0]["frame"]) / self.fps,
+            "confidence": min(1.0, len(wrist_ys) / 10),
+            "metrics": {"max_acceleration": float(max_accel), "accel_ratio": float(accel_ratio)}
+        }
+
+    # =========================================================================
+    # 原有检测方法
+    # =========================================================================
+
+    def _detect_hip_y_relative_to_shoulder_knee(self, condition: str, frames: List[Tuple],
+                                                rep: Any, all_frames: List[Any]) -> Optional[Dict]:
+        """检测臀部离凳"""
+        hip_lifts = []
+        for frame_idx, fd in frames:
+            hip_y = self._get_avg_y(fd, "hip")
+            shoulder_y = self._get_avg_y(fd, "shoulder")
+            knee_y = self._get_avg_y(fd, "knee")
+
+            if hip_y is None or shoulder_y is None or knee_y is None:
+                continue
+
+            shoulder_knee_avg = (shoulder_y + knee_y) / 2
+            body_height = self._estimate_body_height(fd)
+            if body_height <= 0:
+                continue
+
+            deviation = abs(hip_y - shoulder_knee_avg) / body_height * 100
+            hip_lifts.append({
+                "frame": frame_idx,
+                "hip_y": hip_y,
+                "shoulder_knee_avg": shoulder_knee_avg,
+                "deviation_pct": deviation
+            })
+
+        if not hip_lifts:
+            return None
+
+        avg_dev = np.mean([h["deviation_pct"] for h in hip_lifts])
+        max_dev = max(h["deviation_pct"] for h in hip_lifts)
+
+        # 偏差小于 5% 视为正常
+        if max_dev < 5:
+            return None
+
+        return {
+            "value": max_dev,
+            "start_frame": hip_lifts[0]["frame"],
+            "end_frame": hip_lifts[-1]["frame"],
+            "duration": (hip_lifts[-1]["frame"] - hip_lifts[0]["frame"]) / self.fps,
+            "confidence": min(1.0, len(hip_lifts) / 8),
+            "metrics": {"avg_deviation_pct": float(avg_dev), "max_deviation_pct": float(max_dev)}
+        }
+
+    def _detect_elbow_angle_diff(self, condition: str, frames: List[Tuple],
+                                 rep: Any, all_frames: List[Any]) -> Optional[Dict]:
+        """检测左右发力不对称"""
+        diffs = []
+        for frame_idx, fd in frames:
+            le = self._get_angle(fd, "left_elbow")
+            re = self._get_angle(fd, "right_elbow")
+            if le is None or re is None:
+                continue
+            diff = abs(le - re)
+            diffs.append({"frame": frame_idx, "left_elbow": le, "right_elbow": re, "diff": diff})
+
+        if not diffs:
+            return None
+
+        avg_diff = np.mean([d["diff"] for d in diffs])
+        max_diff = max(d["diff"] for d in diffs)
+
+        if avg_diff < 5:
+            return None
+
+        return {
+            "value": float(avg_diff),
+            "start_frame": diffs[0]["frame"],
+            "end_frame": diffs[-1]["frame"],
+            "duration": (diffs[-1]["frame"] - diffs[0]["frame"]) / self.fps,
+            "confidence": min(1.0, len(diffs) / 8),
+            "metrics": {"avg_elbow_diff": float(avg_diff), "max_elbow_diff": float(max_diff)}
+        }
+
+    def _detect_acceleration_at_phase(self, condition: str, frames: List[Tuple],
+                                      rep: Any, all_frames: List[Any]) -> Optional[Dict]:
+        """检测胸部弹震（砸胸）"""
+        return self._detect_bottom_velocity(condition, frames, rep, all_frames)
+
+    def _detect_min_elbow_angle(self, condition: str, frames: List[Tuple],
+                                rep: Any, all_frames: List[Any]) -> Optional[Dict]:
+        """检测动作幅度不足：底部最小肘角"""
+        return self._detect_min_elbow_angle_at_bottom(condition, frames, rep, all_frames)
+
+    def _detect_compare_x_at_phase(self, condition: str, frames: List[Tuple],
+                                   rep: Any, all_frames: List[Any]) -> Optional[Dict]:
+        """检测 X 坐标比较（如膝盖内扣）"""
+        violations = []
+        for frame_idx, fd in frames:
+            lk = self._get_pos(fd, "left_knee")
+            rk = self._get_pos(fd, "right_knee")
+            la = self._get_pos(fd, "left_ankle")
+            ra = self._get_pos(fd, "right_ankle")
+            if not all([lk, rk, la, ra]):
+                continue
+
+            sw = self._get_shoulder_width(fd)
+            left_valgus = lk[0] > la[0] + sw * 0.05
+            right_valgus = rk[0] < ra[0] - sw * 0.05
+
+            if left_valgus or right_valgus:
+                deviation = max(abs(lk[0] - la[0]), abs(rk[0] - ra[0]))
+                violations.append({
+                    "frame": frame_idx,
+                    "deviation": deviation,
+                    "deviation_pct": deviation / sw * 100 if sw > 0 else 0
+                })
+
+        if not violations:
+            return None
+
+        avg_dev = np.mean([v["deviation_pct"] for v in violations])
+        return {
+            "value": float(avg_dev),
+            "start_frame": violations[0]["frame"],
+            "end_frame": violations[-1]["frame"],
+            "duration": (violations[-1]["frame"] - violations[0]["frame"]) / self.fps,
+            "confidence": min(1.0, len(violations) / 10),
+            "metrics": {"avg_deviation_pct": float(avg_dev), "violation_count": len(violations)}
+        }
+
+    def _detect_compare_y_at_phase(self, condition: str, frames: List[Tuple],
+                                   rep: Any, all_frames: List[Any]) -> Optional[Dict]:
+        """检测 Y 坐标比较（如深度不足）"""
+        violations = []
+        for frame_idx, fd in frames:
+            hip_y = self._get_avg_y(fd, "hip")
+            knee_y = self._get_avg_y(fd, "knee")
+            if hip_y is None or knee_y is None:
+                continue
+            if hip_y < knee_y:
+                deviation = knee_y - hip_y
+                bh = self._estimate_body_height(fd)
+                dev_pct = deviation / bh * 100 if bh > 0 else 0
+                violations.append({"frame": frame_idx, "deviation_pct": dev_pct})
+
+        if not violations:
+            return None
+
+        avg_dev = np.mean([v["deviation_pct"] for v in violations])
+        return {
+            "value": float(avg_dev),
+            "start_frame": violations[0]["frame"],
+            "end_frame": violations[-1]["frame"],
+            "duration": (violations[-1]["frame"] - violations[0]["frame"]) / self.fps,
+            "confidence": min(1.0, len(violations) / 5),
+            "metrics": {"avg_deviation_pct": float(avg_dev)}
+        }
+
+    def _detect_angle_at_phase(self, condition: str, frames: List[Tuple],
+                               rep: Any, all_frames: List[Any]) -> Optional[Dict]:
+        """检测角度阈值"""
+        target_angle, threshold = self._parse_angle_condition(condition)
+        if target_angle is None:
+            return None
+
+        violations = []
+        for frame_idx, fd in frames:
+            angle_val = self._get_angle(fd, target_angle)
+            if angle_val is None:
+                continue
+            if ">" in condition and angle_val > threshold:
+                violations.append({"frame": frame_idx, "value": angle_val})
+            elif "<" in condition and angle_val < threshold:
+                violations.append({"frame": frame_idx, "value": angle_val})
+
+        if not violations:
+            return None
+
+        avg_value = np.mean([v["value"] for v in violations])
+        return {
+            "value": float(avg_value),
+            "start_frame": violations[0]["frame"],
+            "end_frame": violations[-1]["frame"],
+            "duration": (violations[-1]["frame"] - violations[0]["frame"]) / self.fps,
+            "confidence": min(1.0, len(violations) / 5),
+            "metrics": {"avg_angle": float(avg_value), "threshold": threshold}
+        }
+
+    def _detect_angle_change_at_phase(self, condition: str, frames: List[Tuple],
+                                      rep: Any, all_frames: List[Any]) -> Optional[Dict]:
+        """检测角度变化（如腰椎弯曲）"""
+        if len(frames) < 3:
+            return None
+
+        angle_changes = []
+        for i in range(1, len(frames)):
+            fd1 = frames[i - 1][1]
+            fd2 = frames[i][1]
+            angles1 = fd1.angles if hasattr(fd1, 'angles') else {}
+            angles2 = fd2.angles if hasattr(fd2, 'angles') else {}
+            for key in ["left_hip_hinge", "right_hip_hinge"]:
+                if key in angles1 and key in angles2:
+                    change = abs(angles2[key] - angles1[key])
+                    angle_changes.append(change)
+
+        if not angle_changes:
+            return None
+
+        max_change = max(angle_changes)
+        if max_change < 10:
+            return None
+
+        return {
+            "value": float(max_change),
+            "start_frame": frames[0][0],
+            "end_frame": frames[-1][0],
+            "duration": (frames[-1][0] - frames[0][0]) / self.fps,
+            "confidence": 0.8,
+            "metrics": {"max_angle_change": float(max_change)}
+        }
+
+    def _detect_velocity_comparison(self, condition: str, frames: List[Tuple],
+                                    rep: Any, all_frames: List[Any]) -> Optional[Dict]:
+        """检测速度比较（如髋部驱动）"""
+        if len(frames) < 5:
+            return None
+
+        hip_ys, shoulder_ys = [], []
+        for frame_idx, fd in frames:
+            hy = self._get_avg_y(fd, "hip")
+            sy = self._get_avg_y(fd, "shoulder")
+            if hy is not None and sy is not None:
+                hip_ys.append(hy)
+                shoulder_ys.append(sy)
+
+        if len(hip_ys) < 5:
+            return None
+
+        hip_vel = np.abs(np.diff(hip_ys))
+        sh_vel = np.abs(np.diff(shoulder_ys))
+        if np.mean(sh_vel) == 0:
+            return None
+
+        ratio = np.mean(hip_vel) / np.mean(sh_vel)
+        deviation = abs(ratio - 1.0)
+        if deviation < 0.3:
+            return None
+
+        return {
+            "value": float(deviation * 100),
+            "start_frame": frames[0][0],
+            "end_frame": frames[-1][0],
+            "duration": (frames[-1][0] - frames[0][0]) / self.fps,
+            "confidence": 0.75,
+            "metrics": {"hip_shoulder_velocity_ratio": float(ratio)}
+        }
+
+    def _detect_midpoint_x_std(self, condition: str, frames: List[Tuple],
+                               rep: Any, all_frames: List[Any]) -> Optional[Dict]:
+        """检测中点 X 标准差（如杠铃轨迹偏移）"""
+        midpoint_xs = []
+        for frame_idx, fd in frames:
+            lw = self._get_pos(fd, "left_wrist")
+            rw = self._get_pos(fd, "right_wrist")
+            if lw and rw:
+                midpoint_xs.append((lw[0] + rw[0]) / 2)
+
+        if len(midpoint_xs) < 5:
+            return None
+
+        std = np.std(midpoint_xs)
+        mean = np.mean(midpoint_xs)
+        cv = std / mean if mean > 0 else 0
+        if cv < 0.05:
+            return None
+
+        return {
+            "value": float(cv * 100),
+            "start_frame": frames[0][0],
+            "end_frame": frames[-1][0],
+            "duration": (frames[-1][0] - frames[0][0]) / self.fps,
+            "confidence": 0.85,
+            "metrics": {"std": float(std), "cv": float(cv)}
+        }
+
+    def _detect_generic(self, condition: str, frames: List[Tuple], rep: Any) -> Optional[Dict]:
+        """通用条件检测（兜底）"""
+        return None
+
+    def _parse_angle_condition(self, condition: str) -> Tuple[Optional[str], float]:
+        """解析角度条件"""
+        parts = condition.split()
+        if len(parts) < 3:
+            return None, 0
+        angle_name = parts[0]
+        try:
+            threshold = float(parts[-1])
+            return angle_name, threshold
+        except ValueError:
+            return None, 0

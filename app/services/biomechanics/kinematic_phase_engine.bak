@@ -1,0 +1,562 @@
+"""
+V9 Greedy Event-Driven Rep Detector
+
+架构根本性变化（相对 V7/V8）：
+  ❌ 删除：TOP × BOTTOM × TOP 全量组合生成
+  ❌ 删除：DP / 贪心分数选择器
+  ❌ 删除：top_recovery / duration_outlier / bot_prominence 作为 Rep 存在性硬门槛
+  ✅ 新增：严格时序事件消费 TOP → BOTTOM → TOP → BOTTOM → ...
+  ✅ 新增：Rep Detection（宽松）与 Rep Quality（严格）完全解耦
+  ✅ 新增：事件诊断表输出（495~752 漏检问题可直接定位）
+  ✅ 保留：信号预处理、峰检测、方向一致性计算等底层能力
+
+核心原则：
+  "先保证 8 次动作能稳定切成 8 个 Rep，再判断这 8 次做得好不好。"
+"""
+
+import numpy as np
+from scipy.signal import find_peaks, savgol_filter
+from dataclasses import dataclass, field
+from typing import List, Any, Optional, Tuple, Dict
+
+
+@dataclass
+class RepResult:
+    """单个 Rep 的结果"""
+    rep_index: int
+    start_frame: int
+    end_frame: int
+    bottom_frame: int
+    duration: float
+    total_rom: float
+    eccentric_duration: float
+    concentric_duration: float
+    top_start_angle: float
+    bottom_angle: float
+    top_end_angle: float
+    # 诊断 / 质量字段（不再用于拒绝 Rep）
+    direction_consistency_ecc: float = 0.0
+    direction_consistency_con: float = 0.0
+    top_recovery_pct: float = 0.0
+    bottom_prominence: float = 0.0
+    cycle_score: float = 0.0
+    phases: List[Any] = field(default_factory=list)
+    errors_detected: List[Any] = field(default_factory=list)
+
+
+class CycleRepDetector:
+    """
+    V9 Greedy Event-Driven Rep Detector
+
+    管线：
+      Signal → 轻度平滑 → TOP/BOTTOM 事件检测
+           → 事件序列清洗（交替校验）
+           → 严格时序消费：TOP → BOTTOM → TOP → ...
+           → 宽松存在性判定（ROM/duration/方向）
+           → 质量指标附加（不拒绝）
+           → 事件诊断表输出
+           → 最终 Reps
+    """
+
+    def __init__(self, fps: float, config: Dict[str, Any]):
+        self.fps = float(fps)
+
+        # ---- Rep 存在性阈值（极宽松）----
+        self.min_rom_existence = float(config.get("min_rom_existence", 15.0))
+        self.min_duration_existence = float(config.get("min_duration_existence", 0.35))
+        self.min_direction_consistency = float(config.get("min_direction_consistency", 0.30))
+
+        # ---- 质量参考阈值（仅记录，不拒绝）----
+        self.quality_min_rom = float(config.get("min_rom_no_pause", 40.0))
+        self.quality_min_top_recovery = float(config.get("quality_min_top_recovery", 82.0))
+
+        # ---- 峰检测参数 ----
+        configured_distance = float(config.get("min_distance_sec", 0.55))
+        self.peak_distance_frames = max(3, int(configured_distance * self.fps * 0.40))
+        self.min_prominence = float(config.get("min_prominence", 10.0))
+
+        # ---- 周期约束（仅用于存在性）----
+        self.min_cycle_frames = max(6, int(self.min_duration_existence * self.fps))
+        max_dur = float(config.get("max_duration", 8.0))  # 放宽到 8s，避免误杀慢速/暂停Rep
+        self.max_cycle_frames = int(max_dur * self.fps)
+
+        # ---- 峰簇合并 ----
+        self.plateau_merge_sec = 0.40
+        self.plateau_merge_frames = max(3, int(self.plateau_merge_sec * self.fps))
+
+        # ---- 事件诊断输出范围（可配置）----
+        self.debug_frame_start = int(config.get("debug_frame_start", 0))
+        self.debug_frame_end = int(config.get("debug_frame_end", 99999))
+
+    # ================================================================
+    # 主入口
+    # ================================================================
+
+    def detect(self, angles: np.ndarray) -> List[RepResult]:
+        angles = np.asarray(angles, dtype=np.float64)
+        n = len(angles)
+        if n < 20:
+            return []
+
+        if not np.all(np.isfinite(angles)):
+            angles = self._fill_nan(angles)
+
+        # Step 1: 轻度平滑
+        signal = self._light_smooth(angles)
+
+        # Step 2: 计算速度信号
+        velocities = self._compute_velocities(signal)
+
+        # Step 3: 检测原始 TOP / BOTTOM 事件
+        raw_tops = self._find_top_candidates(signal)
+        raw_bottoms = self._find_bottom_candidates(signal)
+
+        # Step 4: 事件序列清洗（保证严格交替 T-B-T-B...）
+        events = self._build_clean_event_sequence(signal, raw_tops, raw_bottoms)
+
+        # Step 4.5: 输出事件诊断表
+        self._print_event_diagnostic(signal, velocities, events)
+
+        if len(events) < 3:
+            print("   ❌ 清洗后事件不足 3 个，无法构建任何 Rep")
+            return []
+
+        # Step 5: 严格时序消费 → Rep 列表
+        reps = self._greedy_event_pairing(signal, events)
+
+        # Step 6: 编号 + 输出
+        for idx, rep in enumerate(reps, start=1):
+            rep.rep_index = idx
+
+        self._print_summary(reps)
+
+        return reps
+
+    # ================================================================
+    # Step 4: 事件序列清洗
+    # ================================================================
+
+    def _build_clean_event_sequence(
+        self,
+        signal: np.ndarray,
+        raw_tops: List[int],
+        raw_bottoms: List[int],
+    ) -> List[Tuple[str, int]]:
+        """
+        将原始 TOP/BOTTOM 合并为严格交替的事件序列。
+
+        规则：
+          1. 合并所有事件，按帧排序
+          2. 连续相同类型事件只保留最极值的那个
+          3. 保证输出严格 T-B-T-B-T-B... 交替
+
+        返回: [("TOP", frame), ("BOTTOM", frame), ...]
+        """
+        all_events: List[Tuple[str, int, float]] = []
+        for t in raw_tops:
+            all_events.append(("TOP", t, signal[t]))
+        for b in raw_bottoms:
+            all_events.append(("BOTTOM", b, signal[b]))
+
+        # 按帧排序
+        all_events.sort(key=lambda x: x[1])
+
+        if not all_events:
+            return []
+
+        # 第一轮：去重连续同类型，保留极值
+        deduped: List[Tuple[str, int, float]] = [all_events[0]]
+        for ev_type, frame, val in all_events[1:]:
+            prev_type, prev_frame, prev_val = deduped[-1]
+            if ev_type == prev_type:
+                # 同类型：TOP 取更大值，BOTTOM 取更小值
+                if ev_type == "TOP":
+                    if val > prev_val:
+                        deduped[-1] = (ev_type, frame, val)
+                else:
+                    if val < prev_val:
+                        deduped[-1] = (ev_type, frame, val)
+            else:
+                deduped.append((ev_type, frame, val))
+
+        # 第二轮：确保严格交替（理论上 dedup 后已交替，但做防御性检查）
+        clean: List[Tuple[str, int]] = [(deduped[0][0], deduped[0][1])]
+        for ev_type, frame, val in deduped[1:]:
+            if ev_type != clean[-1][0]:
+                clean.append((ev_type, frame))
+
+        print(f"   🔗 事件清洗: 原始 TOP={len(raw_tops)} BOTTOM={len(raw_bottoms)} "
+              f"→ 清洗后 {len(clean)} 个交替事件")
+
+        return clean
+
+    # ================================================================
+    # Step 5: 严格时序事件消费（核心）
+    # ================================================================
+
+    def _greedy_event_pairing(
+        self,
+        signal: np.ndarray,
+        events: List[Tuple[str, int]],
+    ) -> List[RepResult]:
+        """
+        严格时序消费：TOP → BOTTOM → TOP → BOTTOM → ...
+
+        每个事件最多被消费一次。
+        存在性判定极宽松；质量指标仅附加，不拒绝。
+        """
+        reps: List[RepResult] = []
+        i = 0
+
+        while i < len(events) - 2:
+            # 期望模式：TOP → BOTTOM → TOP
+            if events[i][0] != "TOP":
+                i += 1
+                continue
+
+            top1_type, top1_frame = events[i]
+
+            # 找下一个 BOTTOM
+            bottom_idx = None
+            for j in range(i + 1, len(events)):
+                if events[j][0] == "BOTTOM":
+                    bottom_idx = j
+                    break
+
+            if bottom_idx is None:
+                break  # 没有后续 BOTTOM，结束
+
+            # 找 BOTTOM 之后的下一个 TOP
+            top2_idx = None
+            for j in range(bottom_idx + 1, len(events)):
+                if events[j][0] == "TOP":
+                    top2_idx = j
+                    break
+
+            if top2_idx is None:
+                break  # 没有后续 TOP，结束
+
+            _, bottom_frame = events[bottom_idx]
+            _, top2_frame = events[top2_idx]
+
+            # 构建候选 Rep
+            rep = self._build_rep_from_events(
+                signal, top1_frame, bottom_frame, top2_frame
+            )
+
+            if rep is not None:
+                reps.append(rep)
+                # ✅ 关键：消费掉这三个事件，从 top2 之后继续
+                i = top2_idx + 1
+            else:
+                # 存在性不满足，跳过这个 TOP，尝试下一个
+                i += 1
+
+        return reps
+
+    def _build_rep_from_events(
+        self,
+        signal: np.ndarray,
+        top1: int,
+        bottom: int,
+        top2: int,
+    ) -> Optional[RepResult]:
+        """
+        从三个事件点构建 Rep。
+
+        存在性判定（极宽松）：
+          - duration >= min_duration_existence
+          - ROM >= min_rom_existence
+          - ecc/con 方向一致性 >= min_direction_consistency
+
+        质量指标（仅记录，不拒绝）：
+          - top_recovery_pct
+          - bottom_prominence
+          - cycle_score
+        """
+        span = top2 - top1
+        if span < self.min_cycle_frames:
+            return None
+        if span > self.max_cycle_frames:
+            return None
+
+        duration = span / self.fps
+        if duration < self.min_duration_existence:
+            return None
+
+        # ROM
+        rom = self._compute_rom(signal, top1, bottom, top2)
+        if rom < self.min_rom_existence:
+            return None
+
+        # 方向一致性
+        ecc_dir = self._direction_consistency(signal, top1, bottom, expected_sign=-1)
+        con_dir = self._direction_consistency(signal, bottom, top2, expected_sign=+1)
+
+        if ecc_dir < self.min_direction_consistency:
+            return None
+        if con_dir < self.min_direction_consistency:
+            return None
+
+        # ---- 以下全部是质量指标，不影响 Rep 存在性 ----
+        top_recovery = self._compute_top_recovery(signal, top1, bottom, top2)
+        bottom_prom = self._compute_bottom_prominence(signal, top1, bottom, top2)
+        score = self._score_cycle(rom, ecc_dir, con_dir, top_recovery, bottom_prom, duration)
+
+        top_start_angle = self._median_around(signal, top1, radius=2)
+        bottom_angle = self._median_around(signal, bottom, radius=3)
+        top_end_angle = self._median_around(signal, top2, radius=2)
+
+        return RepResult(
+            rep_index=0,
+            start_frame=top1,
+            end_frame=top2,
+            bottom_frame=bottom,
+            duration=duration,
+            total_rom=rom,
+            eccentric_duration=(bottom - top1) / self.fps,
+            concentric_duration=(top2 - bottom) / self.fps,
+            top_start_angle=top_start_angle,
+            bottom_angle=bottom_angle,
+            top_end_angle=top_end_angle,
+            direction_consistency_ecc=ecc_dir,
+            direction_consistency_con=con_dir,
+            top_recovery_pct=top_recovery,
+            bottom_prominence=bottom_prom,
+            cycle_score=score,
+        )
+
+    # ================================================================
+    # 事件诊断表（P0 调试工具）
+    # ================================================================
+
+    def _print_event_diagnostic(
+        self,
+        signal: np.ndarray,
+        velocities: np.ndarray,
+        events: List[Tuple[str, int]],
+    ):
+        """
+        输出事件诊断表，特别关注 495~752 这类漏检区间。
+
+        FRAME | ELBOW | VELOCITY | SIGN | EVENT | CONF
+        """
+        event_map = {frame: etype for etype, frame in events}
+
+        start = max(0, self.debug_frame_start)
+        end = min(len(signal), self.debug_frame_end)
+
+        print(f"\n{'='*90}")
+        print(f"📋 事件诊断表 (frames {start}–{end})")
+        print(f"{'='*90}")
+        print(f"{'FRAME':>6} | {'ELBOW':>7} | {'VELOCITY':>9} | {'SIGN':>4} | {'EVENT':>7} | NOTES")
+        print(f"{'-'*90}")
+
+        for f in range(start, end):
+            elbow = signal[f] if f < len(signal) else float('nan')
+            vel = velocities[f] if f < len(velocities) else 0.0
+            sign = "+" if vel > 0.5 else ("-" if vel < -0.5 else "0")
+            evt = event_map.get(f, "")
+            notes = ""
+
+            # 标记异常区间
+            if evt:
+                notes = f"← {evt}"
+            elif 495 <= f <= 752 and f % 10 == 0:
+                # 在已知漏检区间每 10 帧采样一次
+                notes = "⚠️ gap zone"
+
+            # 只在有事件或采样点时打印，避免刷屏
+            if evt or notes:
+                print(f"{f:>6} | {elbow:>7.1f} | {vel:>9.2f} | {sign:>4} | {evt:>7} | {notes}")
+
+        print(f"{'='*90}\n")
+
+    # ================================================================
+    # 方向一致性 / Top Recovery / Bottom Prominence / Score
+    # （与 V8 相同，但现在仅作为质量指标）
+    # ================================================================
+
+    def _direction_consistency(
+        self, signal: np.ndarray, start: int, end: int, expected_sign: int
+    ) -> float:
+        segment = signal[start:end + 1]
+        if len(segment) < 4:
+            return 0.0
+        diffs = np.diff(segment)
+        if len(diffs) == 0:
+            return 0.0
+        valid = diffs < 0 if expected_sign < 0 else diffs > 0
+        noise_threshold = 0.3
+        significant = np.abs(diffs) > noise_threshold
+        if significant.sum() == 0:
+            return 0.5
+        return float(np.mean(valid[significant]))
+
+    def _compute_top_recovery(
+        self, signal: np.ndarray, top_start: int, bottom: int, top_end: int
+    ) -> float:
+        ts = self._median_around(signal, top_start, radius=3)
+        b = self._median_around(signal, bottom, radius=3)
+        te = self._median_around(signal, top_end, radius=3)
+        full_range = ts - b
+        if full_range < 3.0:
+            return 100.0
+        return float(min(((te - b) / full_range) * 100.0, 120.0))
+
+    def _compute_bottom_prominence(
+        self, signal: np.ndarray, top_start: int, bottom: int, top_end: int
+    ) -> float:
+        ts = self._median_around(signal, top_start, radius=3)
+        te = self._median_around(signal, top_end, radius=3)
+        b = self._median_around(signal, bottom, radius=3)
+        return float(max(0.0, min(ts, te) - b))
+
+    def _score_cycle(self, rom, ecc_dir, con_dir, top_rec, bot_prom, duration):
+        score = 0.0
+        score += min(rom / 50.0, 3.0)
+        score += ecc_dir * 1.0 + con_dir * 1.0
+        if top_rec >= 95: score += 2.0
+        elif top_rec >= 85: score += 1.5
+        elif top_rec >= 75: score += 0.8
+        score += min(bot_prom / 30.0, 2.0)
+        if 0.8 <= duration <= 4.0: score += 2.0
+        elif 0.6 <= duration <= 5.0: score += 1.0
+        return score
+
+    def _compute_rom(self, signal, top_start, bottom, top_end):
+        ts = self._median_around(signal, top_start, radius=3)
+        te = self._median_around(signal, top_end, radius=3)
+        b = self._median_around(signal, bottom, radius=3)
+        return max(0.0, max(ts, te) - b)
+
+    # ================================================================
+    # TOP / BOTTOM 候选检测（与 V8 相同）
+    # ================================================================
+
+    def _find_top_candidates(self, signal: np.ndarray) -> List[int]:
+        peaks, props = find_peaks(
+            signal, distance=self.peak_distance_frames, prominence=self.min_prominence
+        )
+        if len(peaks) == 0:
+            return []
+        prominences = props.get("prominences", np.zeros(len(peaks)))
+        peaks_list = list(zip(peaks.astype(int), prominences.astype(float)))
+
+        merged = []
+        cluster: List[Tuple[int, float]] = []
+        for frame, prom in peaks_list:
+            if not cluster:
+                cluster.append((frame, prom))
+                continue
+            if frame - cluster[-1][0] <= self.plateau_merge_frames:
+                cluster.append((frame, prom))
+            else:
+                merged.append(self._best_top_from_cluster(signal, cluster))
+                cluster = [(frame, prom)]
+        if cluster:
+            merged.append(self._best_top_from_cluster(signal, cluster))
+        return merged
+
+    def _best_top_from_cluster(self, signal, cluster):
+        frames = [x[0] for x in cluster]
+        return int(max(frames, key=lambda f: signal[f]))
+
+    def _find_bottom_candidates(self, signal: np.ndarray) -> List[int]:
+        valleys, props = find_peaks(
+            -signal,
+            distance=max(3, int(self.peak_distance_frames * 0.5)),
+            prominence=max(self.min_prominence * 0.40, 4.0),
+        )
+        if len(valleys) == 0:
+            return []
+        valleys_list = valleys.astype(int).tolist()
+
+        merged = []
+        cluster: List[int] = []
+        for frame in valleys_list:
+            if not cluster:
+                cluster.append(frame)
+                continue
+            if frame - cluster[-1] <= self.plateau_merge_frames:
+                cluster.append(frame)
+            else:
+                merged.append(min(cluster, key=lambda f: signal[f]))
+                cluster = [frame]
+        if cluster:
+            merged.append(min(cluster, key=lambda f: signal[f]))
+        return merged
+
+    # ================================================================
+    # Signal 预处理
+    # ================================================================
+
+    def _fill_nan(self, x: np.ndarray) -> np.ndarray:
+        x = x.copy()
+        valid = np.isfinite(x)
+        if valid.sum() < 2:
+            return x
+        idx = np.arange(len(x))
+        x[~valid] = np.interp(idx[~valid], idx[valid], x[valid])
+        return x
+
+    def _light_smooth(self, x: np.ndarray) -> np.ndarray:
+        try:
+            if len(x) < 9:
+                return x.copy()
+            window = max(5, int(round(self.fps * 0.15)))
+            if window % 2 == 0:
+                window += 1
+            max_w = len(x) if len(x) % 2 == 1 else len(x) - 1
+            window = min(window, max_w)
+            if window < 5:
+                return x.copy()
+            return savgol_filter(x, window_length=window, polyorder=2)
+        except Exception:
+            return x.copy()
+
+    def _compute_velocities(self, signal: np.ndarray) -> np.ndarray:
+        if len(signal) < 3:
+            return np.zeros(len(signal))
+        return np.gradient(signal) * self.fps
+
+    def _median_around(self, signal: np.ndarray, frame: int, radius: int = 2) -> float:
+        lo = max(0, frame - radius)
+        hi = min(len(signal), frame + radius + 1)
+        values = signal[lo:hi]
+        values = values[np.isfinite(values)]
+        if len(values) == 0:
+            return float(signal[frame])
+        return float(np.median(values))
+
+    # ================================================================
+    # 调试输出
+    # ================================================================
+
+    def _print_summary(self, results: List[RepResult]):
+        print(f"\n{'='*78}")
+        print(f"📌 V9 Greedy Event-Driven Rep Detector")
+        print(f"{'='*78}")
+        print(f"   🏁 最终有效 Rep: {len(results)}")
+        print(f"{'─'*78}")
+
+        for rep in results:
+            quality_flags = []
+            if rep.top_recovery_pct < self.quality_min_top_recovery:
+                quality_flags.append(f"⚠️ lockout={rep.top_recovery_pct:.0f}%")
+            if rep.total_rom < self.quality_min_rom:
+                quality_flags.append(f"⚠️ ROM={rep.total_rom:.1f}°")
+            q_str = " ".join(quality_flags) if quality_flags else "✅ good"
+
+            print(
+                f"   Rep {rep.rep_index}: "
+                f"{rep.start_frame}-{rep.end_frame} | "
+                f"dur={rep.duration:.2f}s | "
+                f"ROM={rep.total_rom:.1f}° | "
+                f"bot={rep.bottom_frame} | "
+                f"ecc={rep.direction_consistency_ecc:.2f} | "
+                f"con={rep.direction_consistency_con:.2f} | "
+                f"rec={rep.top_recovery_pct:.0f}% | "
+                f"{q_str}"
+            )
+        print(f"{'='*78}")
