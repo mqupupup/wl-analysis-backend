@@ -80,6 +80,10 @@ class RepContext:
     bilateral_valid_ratio: float = 0.0
     signal_source: SignalSource = SignalSource.BILATERAL
 
+    # ── Rep-relative wrist 坐标（形状 (N, 2)，用于 bar path 检测）──
+    left_wrist: Optional[np.ndarray] = None
+    right_wrist: Optional[np.ndarray] = None
+
     # ── 阶段列表 ──
     phases: List[PhaseSegment] = field(default_factory=list)
 

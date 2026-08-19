@@ -82,10 +82,11 @@ class RepScoreResult:
 # ═══════════════════════════════════════
 
 TECHNIQUE_WEIGHTS: Dict[str, float] = {
-    "rom": 0.25,
-    "tempo": 0.20,
-    "bottom_control": 0.20,
-    "lockout": 0.20,
+    "bar_path": 0.20,
+    "rom": 0.20,
+    "tempo": 0.15,
+    "bottom_control": 0.15,
+    "lockout": 0.15,
     "symmetry": 0.15,
 }
 
@@ -261,30 +262,172 @@ def compute_bottom_control(rep: RepContext) -> MetricResult:
 # ═══════════════════════════════════════
 
 def compute_lockout(rep: RepContext) -> MetricResult:
+    """
+    V3: 锁定评分 = 顶部角度 + 顶部平台稳定性，不再用单一阈值。
+    """
     top = float(rep.actual_max_angle)
 
     if not np.isfinite(top) or top <= 0:
         return MetricResult("lockout", None, None,
                             MetricStatus.INSUFFICIENT_DATA)
 
-    # 卧推顶端不要求严格 180°，个体差异大
-    #   >=160  充分锁定
-    #   150~160 基本锁定
-    #   140~150 锁定不完全
-    #   130~140 明显未锁定
-    #   <130   严重未锁定
-    if top >= 160:
+    # 如果有 concentric 段数据，计算顶部平台稳定性
+    plateau_bonus = 0.0
+    if rep.bilateral_elbow is not None and rep.has_concentric:
+        cs = max(0, rep.concentric_start - rep.start_frame)
+        ce = min(len(rep.bilateral_elbow), rep.concentric_end - rep.start_frame + 1)
+        if ce - cs >= 5:
+            con_seg = np.asarray(rep.bilateral_elbow[cs:ce], dtype=float)
+            con_seg = con_seg[np.isfinite(con_seg)]
+            if len(con_seg) >= 5:
+                window_size = max(3, int(len(con_seg) * 0.15))
+                top_window = con_seg[-window_size:]
+                top_std = float(np.nanstd(top_window))
+                near_top = float(np.mean(top_window >= top - 3.0))
+                # 稳定平台期加分
+                if top_std <= 3.0 and near_top >= 0.6:
+                    plateau_bonus = 5.0
+
+    # 基础分：顶部角度
+    if top >= 165:
         score = 100.0
-    elif top >= 150:
+    elif top >= 155:
         score = 92.0
-    elif top >= 140:
+    elif top >= 145:
         score = 80.0
-    elif top >= 130:
+    elif top >= 135:
         score = 65.0
     else:
         score = 50.0
 
-    return MetricResult("lockout", raw=top, score=score)
+    score = min(100.0, score + plateau_bonus)
+
+    return MetricResult("lockout", raw=top, score=score,
+                        detail=f"plateau_bonus={plateau_bonus:.0f}")
+
+
+# ═══════════════════════════════════════
+#  4b. Bar Path — 真正的 wrist 轨迹检测
+# ═══════════════════════════════════════
+
+def compute_bar_path(rep: RepContext) -> MetricResult:
+    """
+    V3: 真正的 Bar Path 检测，使用 wrist midpoint 作为代理。
+    第一版只评估轨迹平滑度，不评判水平偏移量（缺乏校准数据）。
+
+    数据来源：
+      - 双侧 wrist 都有 → midpoint
+      - 只有左侧 → left wrist
+      - 只有右侧 → right wrist
+      - 都没有 → INSUFFICIENT_DATA
+    """
+    if not rep.has_concentric:
+        return MetricResult("bar_path", None, None,
+                            MetricStatus.INSUFFICIENT_DATA, "无 concentric 阶段")
+
+    cs = max(0, rep.concentric_start - rep.start_frame)
+    ce = min(
+        rep.concentric_end - rep.start_frame + 1,
+        len(rep.left_wrist) if rep.left_wrist is not None else 0,
+        len(rep.right_wrist) if rep.right_wrist is not None else 0,
+    )
+
+    if ce - cs < 5:
+        return MetricResult("bar_path", None, None,
+                            MetricStatus.INSUFFICIENT_DATA, "concentric 帧数不足")
+
+    # 收集可用的 wrist 轨迹
+    trajectories = []
+    if rep.left_wrist is not None:
+        lw = np.asarray(rep.left_wrist[cs:ce], dtype=float)
+        if lw.ndim == 2 and lw.shape[1] >= 2:
+            trajectories.append(("left", lw))
+    if rep.right_wrist is not None:
+        rw = np.asarray(rep.right_wrist[cs:ce], dtype=float)
+        if rw.ndim == 2 and rw.shape[1] >= 2:
+            trajectories.append(("right", rw))
+
+    if not trajectories:
+        return MetricResult("bar_path", None, None,
+                            MetricStatus.INSUFFICIENT_DATA, "缺少 wrist 坐标数据")
+
+    # 选择轨迹：双侧都有 → midpoint；否则用可用侧
+    if len(trajectories) == 2:
+        lw = trajectories[0][1]
+        rw = trajectories[1][1]
+        valid = np.isfinite(lw[:, 0]) & np.isfinite(rw[:, 0])
+        if valid.sum() < 5:
+            # 双侧同时有效帧不足，退化为单侧
+            for name, traj in trajectories:
+                v = np.isfinite(traj[:, 0])
+                if v.sum() >= 5:
+                    x = traj[v, 0]
+                    y = traj[v, 1]
+                    break
+            else:
+                return MetricResult("bar_path", None, None,
+                                    MetricStatus.INSUFFICIENT_DATA, "wrist 有效帧不足")
+        else:
+            x = (lw[valid, 0] + rw[valid, 0]) / 2.0
+            y = (lw[valid, 1] + rw[valid, 1]) / 2.0
+    else:
+        name, traj = trajectories[0]
+        v = np.isfinite(traj[:, 0])
+        if v.sum() < 5:
+            return MetricResult("bar_path", None, None,
+                                MetricStatus.INSUFFICIENT_DATA, "wrist 有效帧不足")
+        x = traj[v, 0]
+        y = traj[v, 1]
+
+    if len(x) < 5:
+        return MetricResult("bar_path", None, None,
+                            MetricStatus.INSUFFICIENT_DATA, "过滤后有效帧不足")
+
+    # 归一化：以起点为原点
+    x0, y0 = x[0], y[0]
+    dx = x - x0
+    dy = y - y0
+
+    # 尺度归一化：用轨迹的总位移作为参考尺度
+    scale = max(float(np.ptp(dx)), float(np.ptp(dy)), 1.0)
+
+    # 轨迹平滑度：二阶差分的 median magnitude（抗异常帧）
+    if len(dx) >= 3:
+        ddx = np.diff(dx, n=2)
+        ddy = np.diff(dy, n=2)
+        curvature = float(np.median(np.sqrt(ddx**2 + ddy**2)))
+    else:
+        curvature = 0.0
+
+    # 归一化曲率噪声
+    curvature_norm = curvature / scale if scale > 0 else curvature
+
+    # 平滑度评分：curvature_norm 越小越平滑
+    # 这些阈值是工程经验值，未来需要用标注数据校准
+    if curvature_norm <= 0.02:
+        smooth_score = 100.0
+    elif curvature_norm <= 0.05:
+        smooth_score = 90.0
+    elif curvature_norm <= 0.10:
+        smooth_score = 75.0
+    elif curvature_norm <= 0.20:
+        smooth_score = 60.0
+    else:
+        smooth_score = max(30.0, 60.0 - (curvature_norm - 0.20) * 150.0)
+
+    # 水平位移比（仅输出，不参与评分——因为理想 J-path 的偏移量因人而异）
+    horizontal_ratio = float(np.ptp(dx)) / scale if scale > 0 else 0.0
+
+    detail = (f"curvature_norm={curvature_norm:.4f}, "
+              f"horizontal_ratio={horizontal_ratio:.3f}, "
+              f"points={len(x)}")
+
+    return MetricResult(
+        "bar_path",
+        raw=curvature_norm,
+        score=_clamp(smooth_score),
+        detail=detail,
+    )
 
 
 # ═══════════════════════════════════════
@@ -534,6 +677,7 @@ class ExerciseSpecificScorerV2:
 
         # ── Technique ──
         technique_metrics = [
+            compute_bar_path(rep),
             compute_rom(rep),
             compute_tempo(rep),
             compute_bottom_control(rep),

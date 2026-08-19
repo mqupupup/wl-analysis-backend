@@ -138,6 +138,8 @@ class BiomechanicsEngine:
 
         # 提取单侧肘角序列供 RepContext 使用
         left_elbow_arr, right_elbow_arr = self._extract_side_elbow_arrays(frame_data_list)
+        # 提取 wrist 坐标供 bar path 检测使用
+        left_wrist_arr, right_wrist_arr = self._extract_side_wrist_arrays(frame_data_list)
 
         # ── V7 修改点 3: 修复 both_valid 未定义的 Bug ──
         n_frames = len(frame_data_list)
@@ -179,6 +181,8 @@ class BiomechanicsEngine:
                 right_elbow=right_elbow_arr,
                 bilateral_valid_ratio=bilateral_valid_ratio,
                 signal_source=signal_source,
+                left_wrist=left_wrist_arr,
+                right_wrist=right_wrist_arr,
             )
             contexts.append(ctx)
 
@@ -395,6 +399,44 @@ class BiomechanicsEngine:
 
         l_valid = int(np.sum(np.isfinite(left)))
         r_valid = int(np.sum(np.isfinite(right)))
+
+        left_out = left if l_valid > 0 else None
+        right_out = right if r_valid > 0 else None
+        return left_out, right_out
+
+    def _extract_side_wrist_arrays(
+        self, frame_data_list: List[FramePoseData]
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """从 FramePoseData 提取左右 wrist 坐标数组（形状 N×2，用于 bar path）"""
+        n = len(frame_data_list)
+        left = np.full((n, 2), np.nan, dtype=np.float64)
+        right = np.full((n, 2), np.nan, dtype=np.float64)
+
+        WRIST_ALIASES = {
+            "left": ["left_wrist", "LEFT_WRIST", "15"],
+            "right": ["right_wrist", "RIGHT_WRIST", "16"],
+        }
+
+        def _get_pos(fd, side):
+            positions = getattr(fd, "positions", {}) or {}
+            for alias in WRIST_ALIASES[side]:
+                v = positions.get(alias)
+                if v is not None and len(v) >= 2:
+                    return float(v[0]), float(v[1])
+            return None, None
+
+        for i, fd in enumerate(frame_data_list):
+            lx, ly = _get_pos(fd, "left")
+            rx, ry = _get_pos(fd, "right")
+            if lx is not None:
+                left[i, 0] = lx
+                left[i, 1] = ly
+            if rx is not None:
+                right[i, 0] = rx
+                right[i, 1] = ry
+
+        l_valid = int(np.sum(np.isfinite(left[:, 0])))
+        r_valid = int(np.sum(np.isfinite(right[:, 0])))
 
         left_out = left if l_valid > 0 else None
         right_out = right if r_valid > 0 else None

@@ -59,16 +59,105 @@ def detect_incomplete_rom(rep: RepContext, min_rom: float = 60.0) -> ErrorDetect
 
 
 def detect_incomplete_lockout(rep: RepContext, threshold: float = 160.0) -> ErrorDetection:
+    """
+    V3: 锁定检测 = top extension + top plateau + stability，不再用单一 160° 阈值。
+
+    判断逻辑：
+      1. 取 concentric 段末尾 15%（至少 3 帧）作为顶部窗口
+      2. 计算顶部窗口的 std、range、near_top_ratio
+      3. 如果进入平台期（稳定）→ 锁定确认，NOT_DETECTED
+      4. 如果 top >= 165° 且基本稳定 → NOT_DETECTED
+      5. 否则 → DETECTED（confidence 降低，因为可能是个体差异）
+    """
     eid = "bench_incomplete_lockout"
-    if rep.top2_angle <= 0:
-        return ErrorDetection(eid, rep.rep_index, ErrorStatus.INSUFFICIENT_DATA)
-    if rep.top2_angle < threshold:
+
+    if rep.top2_angle <= 0 or not np.isfinite(rep.top2_angle):
+        return ErrorDetection(eid, rep.rep_index, ErrorStatus.INSUFFICIENT_DATA,
+                              detail="顶部角度无效")
+
+    if rep.bilateral_elbow is None:
+        return ErrorDetection(eid, rep.rep_index, ErrorStatus.INSUFFICIENT_DATA,
+                              detail="缺少肘角信号")
+
+    # concentric 段在 rep-relative 数组中的索引
+    cs = max(0, rep.concentric_start - rep.start_frame)
+    ce = min(len(rep.bilateral_elbow), rep.concentric_end - rep.start_frame + 1)
+
+    if ce - cs < 5:
+        # concentric 太短，退化为单一角度判断
+        top = float(rep.top2_angle)
+        if top >= threshold:
+            return ErrorDetection(eid, rep.rep_index, ErrorStatus.NOT_DETECTED,
+                                  value=top, threshold=threshold, confidence=0.7,
+                                  detail=f"concentric 过短，退化为角度判断 top={top:.1f}°")
         return ErrorDetection(eid, rep.rep_index, ErrorStatus.DETECTED,
-                              ErrorSeverity.MODERATE, value=rep.top2_angle,
-                              threshold=threshold, confidence=0.8,
-                              detail=f"TOP2 angle={rep.top2_angle:.1f}°")
-    return ErrorDetection(eid, rep.rep_index, ErrorStatus.NOT_DETECTED,
-                          value=rep.top2_angle, threshold=threshold, confidence=0.8)
+                              ErrorSeverity.MODERATE, value=top, threshold=threshold,
+                              confidence=0.6, detail=f"concentric 过短，top={top:.1f}°")
+
+    con_seg = np.asarray(rep.bilateral_elbow[cs:ce], dtype=float)
+    con_seg = con_seg[np.isfinite(con_seg)]
+
+    if len(con_seg) < 5:
+        return ErrorDetection(eid, rep.rep_index, ErrorStatus.INSUFFICIENT_DATA,
+                              detail="concentric 有效帧不足")
+
+    top = float(np.nanmax(con_seg))
+
+    # 顶部窗口：concentric 末尾 15%，至少 3 帧
+    window_size = max(3, int(len(con_seg) * 0.15))
+    top_window = con_seg[-window_size:]
+
+    top_std = float(np.nanstd(top_window))
+    top_range = float(np.ptp(top_window))
+    near_top_ratio = float(np.mean(top_window >= top - 3.0))
+
+    # 末尾趋势：最后 3 帧的角度变化，如果还在明显上升说明没到平台
+    if len(top_window) >= 3:
+        tail_trend = float(top_window[-1] - top_window[-3])
+    else:
+        tail_trend = 0.0
+
+    detail = (f"top={top:.1f}°, top_std={top_std:.1f}, "
+              f"top_range={top_range:.1f}, plateau={near_top_ratio:.2f}, "
+              f"tail_trend={tail_trend:+.1f}°")
+
+    # ── 判断 1：已经进入稳定平台期 → 锁定确认 ──
+    stable_plateau = (
+        top_std <= 3.0
+        and top_range <= 6.0
+        and near_top_ratio >= 0.60
+        and abs(tail_trend) <= 2.0
+    )
+
+    if stable_plateau:
+        return ErrorDetection(
+            eid, rep.rep_index, ErrorStatus.NOT_DETECTED,
+            value=top, threshold=threshold, confidence=0.9,
+            detail=f"顶部平台期确认，{detail}",
+        )
+
+    # ── 判断 2：角度充分高（>=165°）即使平台不完美也认为锁定 ──
+    if top >= 165.0 and near_top_ratio >= 0.40:
+        return ErrorDetection(
+            eid, rep.rep_index, ErrorStatus.NOT_DETECTED,
+            value=top, threshold=threshold, confidence=0.8,
+            detail=f"顶部角度充分，{detail}",
+        )
+
+    # ── 判断 3：顶部角度极低（<145°）且无平台 → 明确未锁定 ──
+    if top < 145.0:
+        return ErrorDetection(
+            eid, rep.rep_index, ErrorStatus.DETECTED,
+            ErrorSeverity.MODERATE, value=top, threshold=threshold, confidence=0.85,
+            detail=f"顶部角度明显不足，{detail}",
+        )
+
+    # ── 判断 4：中间地带（145~165° 且无稳定平台）→ 报出但 confidence 低 ──
+    return ErrorDetection(
+        eid, rep.rep_index, ErrorStatus.DETECTED,
+        ErrorSeverity.MODERATE, value=top, threshold=threshold, confidence=0.55,
+        detail=f"顶部未形成稳定平台（可能个体差异），{detail}",
+    )
 
 
 def detect_elbow_flare(rep: RepContext) -> ErrorDetection:
