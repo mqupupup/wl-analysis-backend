@@ -84,6 +84,10 @@ class RepContext:
     left_wrist: Optional[np.ndarray] = None
     right_wrist: Optional[np.ndarray] = None
 
+    # ── Rep-relative 上臂-躯干夹角（用于 elbow tuck / shoulder abduction 检测）──
+    left_upper_arm_torso: Optional[np.ndarray] = None
+    right_upper_arm_torso: Optional[np.ndarray] = None
+
     # ── 阶段列表 ──
     phases: List[PhaseSegment] = field(default_factory=list)
 

@@ -161,12 +161,57 @@ def detect_incomplete_lockout(rep: RepContext, threshold: float = 160.0) -> Erro
 
 
 def detect_elbow_flare(rep: RepContext) -> ErrorDetection:
-    """需要肩外展角数据，当前不可用"""
+    """
+    V3: 真正的 elbow flare 检测，使用 upper_arm_torso_angle（上臂与躯干夹角）。
+    不是 elbow joint angle！
+
+    取 bottom 帧附近的 upper_arm_torso_angle，>80° 判定为明显外展。
+    """
+    eid = "bench_elbow_flare"
+
+    # 取 bottom 帧附近的 upper_arm_torso_angle
+    bf_rel = rep.bottom_frame - rep.start_frame
+    window = max(1, int(0.1 * rep.fps))
+
+    values = []
+    for side_arr in [rep.left_upper_arm_torso, rep.right_upper_arm_torso]:
+        if side_arr is None:
+            continue
+        start = max(0, bf_rel - window)
+        end = min(len(side_arr), bf_rel + window + 1)
+        if end > start:
+            seg = np.asarray(side_arr[start:end], dtype=float)
+            seg = seg[np.isfinite(seg)]
+            if len(seg) > 0:
+                values.append(float(np.median(seg)))
+
+    if not values:
+        return ErrorDetection(
+            eid, rep.rep_index,
+            ErrorStatus.INSUFFICIENT_DATA,
+            detail="缺少 upper_arm_torso 数据（feature_extractor 可能未计算）",
+            confidence=0.0,
+        )
+
+    angle = float(np.max(values))  # 取较大的一侧（更外展的一侧）
+
+    if angle > 90.0:
+        sev = ErrorSeverity.SEVERE
+    elif angle > 80.0:
+        sev = ErrorSeverity.MODERATE
+    elif angle > 75.0:
+        sev = ErrorSeverity.MILD
+    else:
+        return ErrorDetection(
+            eid, rep.rep_index, ErrorStatus.NOT_DETECTED,
+            value=angle, threshold=75.0, confidence=0.8,
+            detail=f"upper_arm_torso={angle:.1f}°",
+        )
+
     return ErrorDetection(
-        "bench_elbow_flare", rep.rep_index,
-        ErrorStatus.INSUFFICIENT_DATA,
-        detail="需要肩外展角数据，当前不可用",
-        confidence=0.0,
+        eid, rep.rep_index, ErrorStatus.DETECTED, sev,
+        value=angle, threshold=75.0, confidence=0.8,
+        detail=f"upper_arm_torso={angle:.1f}°",
     )
 
 

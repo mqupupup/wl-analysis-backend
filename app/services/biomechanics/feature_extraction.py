@@ -231,6 +231,14 @@ class V24FeatureExtractor:
             if lh_val is not None and rh_val is not None and "hip_angle_avg" not in fd.angles:
                 fd.angles["hip_angle_avg"] = (lh_val + rh_val) / 2.0
 
+            # 计算上臂-躯干夹角（elbow tuck / shoulder abduction）
+            for side in ["left", "right"]:
+                key = f"{side}_upper_arm_torso"
+                if key not in fd.angles or fd.angles[key] is None:
+                    val = self._calculate_elbow_tuck_angle(fd.positions, side=side)
+                    if val is not None:
+                        fd.angles[key] = val
+
     def _compute_angular_energy_features(self, frame_data_list):
         energies = self.angular_calc.compute_all(frame_data_list)
         elbow_e = (energies.get('left_elbow', 0) + energies.get('right_elbow', 0)) / 2

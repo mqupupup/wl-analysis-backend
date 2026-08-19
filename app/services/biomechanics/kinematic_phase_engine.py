@@ -1133,6 +1133,8 @@ class PhaseBuilder:
         signal_source: str = "bilateral",
         left_wrist: Optional[np.ndarray] = None,
         right_wrist: Optional[np.ndarray] = None,
+        left_upper_arm_torso: Optional[np.ndarray] = None,
+        right_upper_arm_torso: Optional[np.ndarray] = None,
     ) -> RepContext:
         n = len(angles)
         sf = max(0, min(start_frame, n - 1))
@@ -1221,6 +1223,13 @@ class PhaseBuilder:
         if right_wrist is not None and sf < len(right_wrist):
             right_wrist_slice = right_wrist[sf:ef + 1].copy()
 
+        # upper_arm_torso 角度切片
+        left_uat_slice = right_uat_slice = None
+        if left_upper_arm_torso is not None and sf < len(left_upper_arm_torso):
+            left_uat_slice = left_upper_arm_torso[sf:ef + 1].copy()
+        if right_upper_arm_torso is not None and sf < len(right_upper_arm_torso):
+            right_uat_slice = right_upper_arm_torso[sf:ef + 1].copy()
+
         if le_slice is not None and right_elbow_slice is not None:
             le_valid = np.isfinite(le_slice)
             re_valid = np.isfinite(right_elbow_slice)
@@ -1299,4 +1308,6 @@ class PhaseBuilder:
             signal_source=src, phases=phases,
             validation_status=status, fps=self.fps,
             left_wrist=left_wrist_slice, right_wrist=right_wrist_slice,
+            left_upper_arm_torso=left_uat_slice,
+            right_upper_arm_torso=right_uat_slice,
         )

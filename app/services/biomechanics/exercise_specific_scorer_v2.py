@@ -82,12 +82,13 @@ class RepScoreResult:
 # ═══════════════════════════════════════
 
 TECHNIQUE_WEIGHTS: Dict[str, float] = {
-    "bar_path": 0.20,
-    "rom": 0.20,
-    "tempo": 0.15,
-    "bottom_control": 0.15,
-    "lockout": 0.15,
-    "symmetry": 0.15,
+    "bar_path": 0.18,
+    "rom": 0.18,
+    "elbow_tuck": 0.15,
+    "tempo": 0.12,
+    "bottom_control": 0.12,
+    "lockout": 0.12,
+    "symmetry": 0.13,
 }
 
 MOVEMENT_WEIGHTS: Dict[str, float] = {
@@ -258,7 +259,64 @@ def compute_bottom_control(rep: RepContext) -> MetricResult:
 
 
 # ═══════════════════════════════════════
-#  4. Lockout — 顶端肘角
+#  3b. Elbow Tuck — 真正的 upper_arm_torso_angle
+# ═══════════════════════════════════════
+
+def compute_elbow_tuck(rep: RepContext) -> MetricResult:
+    """
+    V3: 真正的 elbow tuck 检测，使用 upper_arm_torso_angle（上臂与躯干夹角）。
+    不是 elbow joint angle！
+
+    评分区间（卧推）：
+      45~70°   favorable（自然内收）
+      30~45°   偏夹紧但可接受
+      70~85°   偏外展但可接受
+      85~90°   明显外展
+      >90°     T型，高肩负荷
+    """
+    # 取 bottom 帧附近的 upper_arm_torso_angle
+    bf_rel = rep.bottom_frame - rep.start_frame
+    window = max(1, int(0.1 * rep.fps))  # bottom 前后 0.1s
+
+    values = []
+    for side_arr in [rep.left_upper_arm_torso, rep.right_upper_arm_torso]:
+        if side_arr is None:
+            continue
+        start = max(0, bf_rel - window)
+        end = min(len(side_arr), bf_rel + window + 1)
+        if end > start:
+            seg = np.asarray(side_arr[start:end], dtype=float)
+            seg = seg[np.isfinite(seg)]
+            if len(seg) > 0:
+                values.append(float(np.median(seg)))
+
+    if not values:
+        return MetricResult("elbow_tuck", None, None,
+                            MetricStatus.INSUFFICIENT_DATA,
+                            "缺少 upper_arm_torso 数据")
+
+    angle = float(np.mean(values))
+
+    # 连续评分
+    if 45.0 <= angle <= 70.0:
+        score = 100.0
+    elif 30.0 <= angle < 45.0:
+        score = 85.0 + (angle - 30.0) * 1.0  # 30→85, 45→100
+    elif 70.0 < angle <= 85.0:
+        score = 100.0 - (angle - 70.0) * 1.0  # 70→100, 85→85
+    elif 85.0 < angle <= 90.0:
+        score = 85.0 - (angle - 85.0) * 4.0  # 85→85, 90→65
+    elif angle < 30.0:
+        score = max(60.0, 85.0 - (30.0 - angle) * 1.5)
+    else:  # > 90
+        score = max(40.0, 65.0 - (angle - 90.0) * 2.0)
+
+    return MetricResult("elbow_tuck", raw=angle, score=_clamp(score),
+                        detail=f"upper_arm_torso={angle:.1f}°")
+
+
+# ═══════════════════════════════════════
+#  4. Lockout — 顶部角度 + 平台稳定性
 # ═══════════════════════════════════════
 
 def compute_lockout(rep: RepContext) -> MetricResult:
@@ -679,6 +737,7 @@ class ExerciseSpecificScorerV2:
         technique_metrics = [
             compute_bar_path(rep),
             compute_rom(rep),
+            compute_elbow_tuck(rep),
             compute_tempo(rep),
             compute_bottom_control(rep),
             compute_lockout(rep),

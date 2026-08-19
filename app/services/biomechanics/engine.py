@@ -140,6 +140,8 @@ class BiomechanicsEngine:
         left_elbow_arr, right_elbow_arr = self._extract_side_elbow_arrays(frame_data_list)
         # 提取 wrist 坐标供 bar path 检测使用
         left_wrist_arr, right_wrist_arr = self._extract_side_wrist_arrays(frame_data_list)
+        # 提取 upper_arm_torso 角度供 elbow tuck 检测使用
+        left_uat_arr, right_uat_arr = self._extract_side_upper_arm_torso_arrays(frame_data_list)
 
         # ── V7 修改点 3: 修复 both_valid 未定义的 Bug ──
         n_frames = len(frame_data_list)
@@ -183,6 +185,8 @@ class BiomechanicsEngine:
                 signal_source=signal_source,
                 left_wrist=left_wrist_arr,
                 right_wrist=right_wrist_arr,
+                left_upper_arm_torso=left_uat_arr,
+                right_upper_arm_torso=right_uat_arr,
             )
             contexts.append(ctx)
 
@@ -437,6 +441,30 @@ class BiomechanicsEngine:
 
         l_valid = int(np.sum(np.isfinite(left[:, 0])))
         r_valid = int(np.sum(np.isfinite(right[:, 0])))
+
+        left_out = left if l_valid > 0 else None
+        right_out = right if r_valid > 0 else None
+        return left_out, right_out
+
+    def _extract_side_upper_arm_torso_arrays(
+        self, frame_data_list: List[FramePoseData]
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """从 FramePoseData 提取左右 upper_arm_torso 角度序列（由 feature_extractor 计算并存入 fd.angles）"""
+        n = len(frame_data_list)
+        left = np.full(n, np.nan, dtype=np.float64)
+        right = np.full(n, np.nan, dtype=np.float64)
+
+        for i, fd in enumerate(frame_data_list):
+            angles = getattr(fd, "angles", {}) or {}
+            lv = angles.get("left_upper_arm_torso")
+            rv = angles.get("right_upper_arm_torso")
+            if lv is not None and np.isfinite(lv):
+                left[i] = float(lv)
+            if rv is not None and np.isfinite(rv):
+                right[i] = float(rv)
+
+        l_valid = int(np.sum(np.isfinite(left)))
+        r_valid = int(np.sum(np.isfinite(right)))
 
         left_out = left if l_valid > 0 else None
         right_out = right if r_valid > 0 else None
