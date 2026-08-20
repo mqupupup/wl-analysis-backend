@@ -6,6 +6,7 @@ V2 RepContext 架构 + V8 CycleRepDetector 兼容版
 
 import types
 import json
+import cv2
 import numpy as np
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -257,6 +258,8 @@ class BiomechanicsEngine:
         error_summary = self._summarize_v2_errors(set_errors, valid_contexts)
         feedback = self._generate_v2_feedback(rep_scores, set_errors, exercise)
         skeleton_frames = self._build_skeleton_frames(frame_data_list, target_count=8)
+        key_frames = self._build_key_frames(video_path, frame_data_list, contexts,
+                                            set_errors, valid_contexts)
         angle_curves = self._extract_angle_curves(frame_data_list)
 
         # 兼容旧版 v2_reps 格式
@@ -312,6 +315,7 @@ class BiomechanicsEngine:
                 "velocity_curve": [],
             },
             "skeleton_frames": skeleton_frames,
+            "key_frames": key_frames,
             "angle_curves": angle_curves,
             "summary_metrics": {
                 "duration_sec": round(len(frame_data_list) / fps, 1),
@@ -1002,6 +1006,146 @@ class BiomechanicsEngine:
                 "bones": bones, "joints": joints,
                 "angles": [{"name": k, "value": round(v, 1)} for k, v in fd.angles.items()]
             })
+        return key_frames
+
+    # =========================================================================
+    # Evidence Frame v1 — 关键事件证据帧
+    # =========================================================================
+    def _build_key_frames(self, video_path: Path, frame_data_list: List[FramePoseData],
+                          contexts: List[RepContext], set_errors: List[SetLevelError],
+                          valid_contexts: List[RepContext]) -> List[Dict[str, Any]]:
+        """
+        为每个有效 rep 提取 Bottom / Lockout 关键事件帧。
+        返回原始视频帧图片 URL + landmarks + quality + metrics + evidence_for。
+        前端负责在图片上叠加骨骼和角度，后端不烤死图片。
+        """
+        session_dir = video_path.parent
+        session_id = session_dir.name
+
+        # frame_idx → FramePoseData 快速查找
+        frame_map = {fd.frame_idx: fd for fd in frame_data_list}
+
+        # MediaPipe landmark 索引 → 部位名称
+        LM_NAMES = {
+            11: 'left_shoulder', 12: 'right_shoulder',
+            13: 'left_elbow', 14: 'right_elbow',
+            15: 'left_wrist', 16: 'right_wrist',
+            23: 'left_hip', 24: 'right_hip',
+            25: 'left_knee', 26: 'right_knee',
+            27: 'left_ankle', 28: 'right_ankle',
+        }
+        LEFT_JOINTS = {'left_shoulder', 'left_elbow', 'left_wrist',
+                       'left_hip', 'left_knee', 'left_ankle'}
+        RIGHT_JOINTS = {'right_shoulder', 'right_elbow', 'right_wrist',
+                        'right_hip', 'right_knee', 'right_ankle'}
+
+        # 错误 → 事件类型映射：lockout 类错误关联锁定帧，其余关联底部帧
+        def _event_for_error(eid: str) -> str:
+            return 'lockout' if 'lockout' in eid else 'bottom'
+
+        # 按 (rep_index, event) 组织 evidence_for
+        evidence_map: Dict[tuple, list] = {}
+        for err in set_errors:
+            evt = _event_for_error(err.error_id)
+            for rep_idx in err.occurrences:
+                evidence_map.setdefault((rep_idx, evt), []).append({
+                    'rule': err.error_id,
+                    'name': err.display_name,
+                    'value': round(err.avg_value, 1) if err.avg_value is not None else None,
+                    'severity': err.worst_severity.value if err.worst_severity else None,
+                })
+
+        key_frames: List[Dict[str, Any]] = []
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            print(f"[WARNING] Cannot open video for keyframes: {video_path}")
+            return []
+
+        fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        for ctx in valid_contexts:
+            for event_type, fidx in [
+                ('bottom', ctx.bottom_frame),
+                ('lockout', ctx.concentric_end if ctx.concentric_end >= 0 else ctx.end_frame),
+            ]:
+                # 精确匹配失败时搜索最近的有效姿态帧（±9帧）
+                fd = frame_map.get(fidx)
+                if fd is None:
+                    for offset in range(1, 10):
+                        for cand in (fidx - offset, fidx + offset):
+                            if cand in frame_map:
+                                fd, fidx = frame_map[cand], cand
+                                break
+                        if fd:
+                            break
+                if fd is None:
+                    print(f"[WARNING] KeyFrame: no pose data near frame {fidx} "
+                          f"(rep {ctx.rep_index} {event_type})")
+                    continue
+
+                # 提取视频帧图片
+                img_filename = f"keyframe_rep{ctx.rep_index}_{event_type}.jpg"
+                img_path = session_dir / img_filename
+                cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+                ret, frame = cap.read()
+                if not ret:
+                    print(f"[WARNING] KeyFrame: failed to read video frame {fidx}")
+                    continue
+                cv2.imwrite(str(img_path), frame)
+
+                # 构建 landmarks 和 bones
+                landmarks = []
+                bones = []
+                detected = set()
+                for name in LM_NAMES.values():
+                    if name in fd.positions:
+                        pos = fd.positions[name]
+                        landmarks.append({
+                            'name': name,
+                            'position': [round(pos[0]), round(pos[1])],
+                        })
+                        detected.add(name)
+
+                for si, ei, bn in SKELETON_CONNECTIONS:
+                    sn, en = LM_NAMES.get(si), LM_NAMES.get(ei)
+                    if sn in fd.positions and en in fd.positions:
+                        bones.append({
+                            'name': bn,
+                            'start': [round(fd.positions[sn][0]), round(fd.positions[sn][1])],
+                            'end': [round(fd.positions[en][0]), round(fd.positions[en][1])],
+                        })
+
+                # 质量评分
+                quality = round(len(detected) / 12, 2)
+                left_q = round(len(detected & LEFT_JOINTS) / 6, 2)
+                right_q = round(len(detected & RIGHT_JOINTS) / 6, 2)
+
+                # 关键角度
+                metrics = {k: round(v, 1) for k, v in fd.angles.items()}
+
+                key_frames.append({
+                    'type': event_type,
+                    'rep_index': ctx.rep_index,
+                    'frame_idx': fidx,
+                    'pct': round(fidx / max(len(frame_data_list) - 1, 1) * 100),
+                    'image_url': f"/uploads/{session_id}/{img_filename}",
+                    'frame_width': fw,
+                    'frame_height': fh,
+                    'quality': quality,
+                    'left_quality': left_q,
+                    'right_quality': right_q,
+                    'landmarks': landmarks,
+                    'bones': bones,
+                    'metrics': metrics,
+                    'evidence_for': evidence_map.get((ctx.rep_index, event_type), []),
+                })
+
+        cap.release()
+        kf_labels = ", ".join(
+            "{0}#{1}".format(kf["type"], kf["rep_index"]) for kf in key_frames
+        )
+        print(f"🖼️ 关键证据帧: {len(key_frames)} 张 ({kf_labels})")
         return key_frames
 
     def _extract_angle_curves(self, frame_data_list):
