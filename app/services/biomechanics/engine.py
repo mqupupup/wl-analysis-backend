@@ -1039,14 +1039,23 @@ class BiomechanicsEngine:
         RIGHT_JOINTS = {'right_shoulder', 'right_elbow', 'right_wrist',
                         'right_hip', 'right_knee', 'right_ankle'}
 
-        # 错误 → 事件类型映射：lockout 类错误关联锁定帧，其余关联底部帧
-        def _event_for_error(eid: str) -> str:
-            return 'lockout' if 'lockout' in eid else 'bottom'
+        # 错误 → 关键事件帧映射
+        # lockout: 锁定不完全、左右不对称（推起到顶时最明显）
+        # None: setup 类错误（握距等），不关联到 bottom/lockout 关键帧
+        # 其余默认 bottom（ROM、外展、反弹、臀部离凳、离心速度、轨迹、触胸漂移）
+        def _event_for_error(eid: str) -> Optional[str]:
+            if 'lockout' in eid or 'asymmetric' in eid:
+                return 'lockout'
+            if 'grip' in eid or 'width' in eid:
+                return None
+            return 'bottom'
 
         # 按 (rep_index, event) 组织 evidence_for
         evidence_map: Dict[tuple, list] = {}
         for err in set_errors:
             evt = _event_for_error(err.error_id)
+            if evt is None:
+                continue
             for rep_idx in err.occurrences:
                 evidence_map.setdefault((rep_idx, evt), []).append({
                     'rule': err.error_id,
