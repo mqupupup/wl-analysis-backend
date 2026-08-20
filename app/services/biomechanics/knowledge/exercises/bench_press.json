@@ -584,85 +584,75 @@
             "severity": "medium",
             "source_type": "heuristic",
             "category": "path",
-            "measurement_note": "当前使用 wrist_midpoint 作为杠铃轨迹代理。检测三个维度：(1) path_offset 杠铃相对于肩中线的异常横向偏移；(2) lateral_wobble 横向反复摆动/S型回摆；(3) path_shape 相对于二次平滑轨迹的残差+方向反转。正常J型位移不判错，但过大的解剖参考偏移会报错。",
+            "measurement_note": "当前使用 wrist_midpoint 作为杠铃轨迹代理。V8 采用分阶段分析（eccentric/concentric），用 path_amplitude 归一化（而非 shoulder_width），dead-zone 过滤低幅度 pose jitter，只统计持续≥3帧的反向运动。三个指标：phase_monotonicity（阶段横向趋势是否总体一致）、sustained_lateral_excursion（是否存在持续明显横向偏移）、high_frequency_wobble（是否存在真正的快速左右摆动）。正常 J 型轨迹天然允许一次方向反转，不会被误判。",
             "risk_note": [
                 "过大的横向偏移会增加肩部剪切力",
                 "S型横向摆动反映发力协调性不足",
                 "整体轨迹偏移可能导致发力线不对齐"
             ],
             "detect": {
-                "method": "wrist_midpoint_path_geometry_v6",
-                "version": "V6",
+                "method": "wrist_midpoint_path_geometry_v8",
+                "version": "V8",
                 "signals": [
-                    "proxy_mode (bilateral_midpoint / mixed_wrist_proxy / sparse_wrist_proxy)",
-                    "quality (bilateral=0.90, mixed=0.68, sparse=0.50)",
-                    "bar_valid_ratio (逐帧mixed proxy的有效帧比例)",
+                    "proxy_mode (left_wrist_only / right_wrist_only / bilateral_midpoint / mixed_wrist_proxy)",
+                    "quality (单侧=0.78, bilateral=0.90, mixed=0.60)",
+                    "bar_valid_ratio (有效帧比例)",
                     "left_valid_ratio / right_valid_ratio / both_valid_ratio",
-                    "frame_idx / valid_idx (真实时间轴，不等间距)",
-                    "median_filter (3点中值滤波，去除左右切换跳变)",
-                    "speed_gate (速度门控，位移>0.20*IQR的跳点被插值恢复)",
-                    "jumps_removed (速度门控去除的跳点数量)",
                     "full_rep (完整rep分析，eccentric+concentric)",
-                    "path_offset_p90 (杠铃x相对于肩中线的90百分位绝对偏移，辅助证据)",
-                    "path_offset_max (杠铃x相对于肩中线的最大绝对偏移)",
-                    "lateral_wobble (total_variation - net_shift，横向反复摆动量)",
-                    "curve_residual_rms (reference path corridor，二次拟合RMS残差，使用真实时间轴)",
-                    "curve_residual_peak (二次拟合峰值残差)",
-                    "direction_reversals (横向方向反转次数，阈值0.8% shoulder_width)",
-                    "net_horizontal_shift (bottom→top净水平位移，不直接判错)"
+                    "path_amplitude (卧推本身的水平运动幅度，95th-5th percentile，用于归一化)",
+                    "x_norm (归一化后的横向坐标，median为0，除以path_amplitude)",
+                    "eccentric_phase / concentric_phase (分阶段分析，以bottom_frame为分界)",
+                    "phase_monotonicity (每阶段反向帧占比，<30%为正常)",
+                    "sustained_lateral_excursion (持续≥3帧的反向运动段数和累计位移)",
+                    "high_frequency_wobble (方向持续≥3帧的反转次数，<2为正常)",
+                    "dead_zone (EPS=0.015，小于1.5% path_amplitude的变化视为pose noise)"
                 ],
                 "logic": {
-                    "upstream_fix": "pose_estimation.py 对 wrist(15,16) 使用更低 visibility 阈值(0.15)，其他关节保持0.3，避免wrist被杠铃遮挡时大量NaN",
-                    "analysis_range": "完整 rep [start→end]，eccentric+concentric，去掉前后各1帧边界噪声。替代V5的仅concentric分析",
+                    "upstream_fix": "pose_estimation.py 对 wrist(15,16) 使用更低 visibility 阈值(0.15)，通过独立的 wrist_positions_relaxed 字段传递，不影响次数检测",
+                    "analysis_range": "完整 rep [start→end]，eccentric+concentric，去掉前后各1帧边界噪声",
                     "proxy_selection": {
+                        "left_wrist_only": "left_ratio>=0.80 → 只用左侧手腕（置信度0.78），避免左右切换跳变",
+                        "right_wrist_only": "right_ratio>=0.80 → 只用右侧手腕（置信度0.78）",
                         "bilateral_midpoint": "both_ratio>=0.50 → 双腕midpoint（置信度0.90）",
-                        "mixed_wrist_proxy": "both_ratio<0.50 但 bar_valid_ratio>=0.65 → 逐帧mixed（置信度0.68）",
-                        "sparse_wrist_proxy": "bar_valid_ratio<0.65 但 valid_frames>=8 → 稀疏mixed（置信度0.50）",
+                        "mixed_wrist_proxy": "其他情况 → 逐帧mixed（置信度0.60）",
                         "insufficient": "valid_frames<8 → INSUFFICIENT_DATA"
                     },
-                    "mixed_proxy_strategy": "逐帧选择：both valid→midpoint, left only→left, right only→right, none→NaN",
-                    "preprocessing": [
-                        "线性插值填充NaN（用于中值滤波和速度门控）",
-                        "3点中值滤波（去除mixed proxy左右切换产生的人为跳变）",
-                        "速度门控：位移>0.20*IQR的跳点被前后值平均替换，线性插值恢复"
-                    ],
-                    "time_axis": "使用valid_idx计算真实时间轴t，替代linspace(0,1,n)的等间距假设",
-                    "coordinate_mode": "逐帧 shoulder_mid_x（数组），不是固定median",
-                    "smoothing": "7点移动平均平滑",
+                    "normalization": "用 path_amplitude（95th-5th percentile of x_raw）归一化，而非 shoulder_width。侧视视频中 shoulder_width 很小（躯干长度仅12px），1px抖动就会被放大成0.08。用卧推本身的水平运动幅度作为尺度更稳定。",
+                    "dead_zone": "EPS=0.015（1.5% of path_amplitude），小于这个幅度的 dx 变化视为 MediaPipe pose noise，直接置0。避免单帧抖动被算成方向反转。",
+                    "phase_analysis": "以 bottom_frame 为分界点，分 eccentric 和 concentric 两个阶段独立分析。正常 J 型轨迹在 bottom 处有一次方向反转是允许的，不会被算成 wobble。",
                     "dimensions": {
-                        "path_offset": "p90_abs_offset >= 0.30 moderate, >= 0.40 severe（辅助证据）",
-                        "lateral_wobble": "wobble >= 0.08 moderate, >= 0.14 severe",
-                        "path_shape": "residual >= 0.045 moderate, >= 0.075 severe; reversals >= 4 moderate, >= 7 severe（reference path corridor）"
+                        "phase_monotonicity": "每阶段计算 dx 的主导方向（median sign），统计与主导方向相反的帧占比。<30%为正常，>=50%为severe。两个阶段都正常才整体正常。",
+                        "sustained_lateral_excursion": "统计连续≥3帧的反向运动段。0段为正常，存在累计位移>=15% path_amplitude的段为severe。",
+                        "high_frequency_wobble": "压缩连续相同符号（要求持续≥3帧），统计方向反转次数。<2为正常，>=3为severe。"
                     },
                     "severe": [
-                        "severe_evidence >= 2 (至少两类强证据)",
-                        "offset_severe + 任何其他严重动态证据"
+                        "severe_count >= 2 (phase_monotonicity_severe, sustained_severe, hf_wobble_severe 中至少两类)"
                     ],
                     "moderate": [
-                        "offset_severe 单独可触发 (避免纯粹平滑偏移漏检)",
-                        "offset_moderate + 任何其他动态/形状证据",
-                        "moderate_evidence >= 2 (至少两类中等证据)"
+                        "abnormal_count >= 2 (三个指标中至少两类异常)"
                     ],
                     "normal": "其他",
-                    "key_principle": "完整rep分析+中值滤波+速度门控，确保mixed proxy的左右切换不会产生人为轨迹跳变；reference path corridor用二次拟合残差检测偏离平滑轨迹的程度"
+                    "key_principle": "正常 J 型轨迹天然允许一次方向反转，不会被误判。只有持续的横向回摆、阶段趋势不一致、或真正的高频摆动才会报错。用 path_amplitude 归一化避免侧视视频中 shoulder_width 太小导致的假阳性。"
                 },
                 "at_phase": ["eccentric", "concentric"],
-                "v6_fixes": [
-                    "修复V5数据不足：上游pose_estimation.py对wrist(15,16)使用更低visibility阈值(0.15)，其他关节保持0.3。wrist经常被杠铃遮挡，visibility在0.1-0.3之间被0.3门控过滤掉",
-                    "修复V5分析范围过窄：V5仅分析concentric(31帧)，V6分析完整rep[eccentric+concentric]，与规格文件at_phase一致",
-                    "修复V5 mixed proxy跳变：V5逐帧选择left/right/midpoint，left-only和right-only坐标处于不同透视位置，直接拼接产生人为跳变。V6加3点中值滤波+速度门控去除跳变",
-                    "速度门控：位移>0.20*IQR的跳点被前后值平均替换，jumps_removed记录去除数量",
-                    "reference path corridor改进：用完整rep的二次拟合作为参考曲线，计算actual vs fitted的residual_rms和residual_peak",
-                    "p90_offset保留为辅助证据（检测整体偏移），residual作为主要路径偏差指标",
-                    "去掉前后各1帧边界噪声，避免rep起始/结束帧的不稳定影响轨迹分析"
+                "v8_fixes": [
+                    "修复V7假阳性：V7中wobble=total_variation-net_shift会把正常J型轨迹当成摆动（J型天然有大量非净位移），reversal=15是MediaPipe抖动被算进去，residual=0.123是真实轨迹不像二次函数不代表左右晃。三项全部SEVERE导致正常轨迹被误判。",
+                    "删除wobble=total_variation-net_shift：正常J型轨迹下降和推起方向相反，total_variation很大但net_shift很小，wobble天然就大。这个公式不适合卧推。",
+                    "删除全局reversal计数：正常J型本身就有一次方向反转，MediaPipe单帧抖动会被算成reversal。V7中reversals=15大部分是噪声。",
+                    "删除quadratic residual：真实卧推轨迹不一定是标准二次函数，residual大不代表左右晃。轨迹形状检测应该单独做PathShapeAnalyzer，不和stability混在一起。",
+                    "分eccentric/concentric阶段分析：以bottom_frame为分界，每个阶段独立判断横向趋势是否总体一致。正常J型在bottom处的方向反转是允许的。",
+                    "用path_amplitude归一化：侧视视频中shoulder_width很小（躯干长度仅12px），1px MediaPipe抖动就会被放大成0.08，接近WOBBLE_MODERATE=0.08。用卧推本身的水平运动幅度（95th-5th percentile）作为尺度更稳定。",
+                    "dead-zone过滤：EPS=0.015（1.5% of path_amplitude），小于这个幅度的dx变化视为pose noise，直接置0。避免单帧抖动被算成方向反转。",
+                    "只统计持续≥3帧的反向运动：连续1-2帧的反向大概率是MediaPipe抖动，只有持续≥3帧的反向运动才算一次sustained reversal。高频摆动也要求每次方向持续≥3帧。",
+                    "三个新指标：phase_monotonicity（阶段横向趋势一致性）、sustained_lateral_excursion（持续横向偏移）、high_frequency_wobble（真正的快速左右摆动）。"
                 ],
                 "known_limitations": [
-                    "path_offset使用abs(bar_x - shoulder_mid_x)作为辅助证据，长期应升级为基于bottom/top的reference corridor（V7）",
-                    "使用wrist_midpoint作为bar proxy，非真实杠铃检测",
-                    "7点移动平均假设帧间距近似均匀，丢帧较多时可能有微小误差",
-                    "中值滤波和速度门控可能会平滑真实的快速运动，但kernel size=3影响较小",
-                    "sparse_wrist_proxy模式下置信度较低(0.50)，结果应标注为'疑似'",
-                    "上游wrist阈值降低(0.15)可能引入低质量wrist坐标，依赖中值滤波+速度门控过滤"
+                    "使用wrist作为bar proxy，非真实杠铃检测",
+                    "7点移动平均假设帧间距近似均匀",
+                    "path_amplitude作为归一化尺度，如果水平运动本身很小（正面视频），会fallback到shoulder_width",
+                    "dead_zone EPS=0.015是工程初始值，需要真实数据集校准",
+                    "持续≥3帧的阈值假设30fps，高帧率视频可能需要调整",
+                    "轨迹形状检测（J型/直上直下/反J型）未实现，未来可单独做PathShapeAnalyzer"
                 ]
             },
             "severity_levels": {

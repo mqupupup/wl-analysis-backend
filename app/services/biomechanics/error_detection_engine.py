@@ -608,36 +608,36 @@ def detect_eccentric_speed(rep: RepContext) -> ErrorDetection:
 
 def detect_bar_path(rep: RepContext) -> ErrorDetection:
     """
-    V6: 杠铃轨迹几何 + 稳定性检测（完整rep + 中值滤波 + 速度门控）。
+    V8: Phase-Aware Bar Path Detector（修复 V7 正常 J 型轨迹被误判）。
 
-    核心修复（解决 V5 数据不足 + 几何定义问题）：
-    1. 分析完整 rep [start→end]，而不是只 concentric（规格要求 eccentric+concentric）
-    2. mixed proxy 后加 3 点中值滤波，去除 left/right 切换产生的人为跳变
-    3. 速度门控：去除不连续跳点（位移 > 0.20*shoulder_width），线性插值恢复
-    4. reference path corridor：用完整 rep 的二次拟合作为参考曲线，计算 residual
-    5. p90_offset 保留作为辅助证据（检测整体偏移），residual 作为主要路径偏差指标
-    6. 上游配合：pose_estimation.py 对 wrist(15,16) 使用更低 visibility 阈值(0.15)
+    核心修复（解决 V7 正常轨迹被误判 SEVERE）：
+    1. 删除 wobble = total_variation - net_shift：正常 J 型轨迹天然有大量"非净位移"，
+       这个公式会把正常 J 型当成摆动。
+    2. 删除全局 reversal 计数：正常 J 型本身就有一次方向反转，MediaPipe 抖动会被算成 reversal。
+    3. 删除 quadratic residual：真实轨迹不像二次函数不代表左右晃。
+    4. 分 eccentric / concentric 阶段分析：每阶段横向趋势是否总体一致。
+    5. 用 path_amplitude 归一化（而不是 shoulder_width）：侧视视频中 shoulder_width 很小
+       （躯干长度仅12px），1px抖动就会被放大成0.08。
+    6. dead-zone 过滤低幅度 pose jitter：|dx| < EPS 视为 0。
+    7. 只统计持续 ≥3 帧的反向运动：避免 MediaPipe 单帧抖动被算成 reversal。
 
-    V5 的问题：只分析 concentric（31帧），mixed proxy 左右切换产生跳变，
-    wrist 上游 visibility>0.3 门控太严导致只有 5/31 帧可用。
+    V7 的问题：wobble=2.513, residual=0.123, reversals=15 全部 SEVERE，
+    但实际是正常 J 型轨迹 + MediaPipe 抖动 + shoulder_width 太小导致的假阳性。
     """
     eid = "bench_bar_path"
 
     # ═══════════════════════════════════════════════════════════
-    # 0. 诊断日志（函数最开头，确保所有早退原因都能看到）
+    # 0. 诊断日志
     # ═══════════════════════════════════════════════════════════
-    print(f"\n   🛤️ [BarPath V6] Rep {rep.rep_index}")
+    print(f"\n   🛤️ [BarPath V8] Rep {rep.rep_index}")
     left_shape = None if rep.left_wrist is None else np.asarray(rep.left_wrist).shape
     right_shape = None if rep.right_wrist is None else np.asarray(rep.right_wrist).shape
     print(f"   🛤️   left_wrist={left_shape}")
     print(f"   🛤️   right_wrist={right_shape}")
     print(f"   🛤️   rep_abs=[{rep.start_frame}, {rep.end_frame}]")
-    print(f"   🛤️   concentric_abs=[{rep.concentric_start}, {rep.concentric_end}]")
-    if rep.bottom_frame is not None:
-        print(f"   🛤️   bottom_frame={rep.bottom_frame}")
 
     # ═══════════════════════════════════════════════════════════
-    # 1. 基础数据（允许单侧为 None）
+    # 1. 基础数据
     # ═══════════════════════════════════════════════════════════
     if rep.left_wrist is None and rep.right_wrist is None:
         print("   ❌ [BarPath] EARLY RETURN: 两侧 wrist 都是 None")
@@ -648,7 +648,7 @@ def detect_bar_path(rep: RepContext) -> ErrorDetection:
     right = np.asarray(rep.right_wrist, dtype=float) if rep.right_wrist is not None else None
 
     # ═══════════════════════════════════════════════════════════
-    # 2. 完整 rep 范围（eccentric + concentric）
+    # 2. 完整 rep 范围
     # ═══════════════════════════════════════════════════════════
     start = 0
     end_candidates = []
@@ -663,21 +663,19 @@ def detect_bar_path(rep: RepContext) -> ErrorDetection:
         start += 1
         end -= 1
 
-    print(f"   🛤️   full_rep=[{start}:{end}] len={end - start}")
+    n = end - start
+    print(f"   🛤️   full_rep=[{start}:{end}] len={n}")
 
-    if end - start < 8:
-        print(f"   ❌ [BarPath] EARLY RETURN: full rep len={end - start} < 8")
+    if n < 8:
+        print(f"   ❌ [BarPath] EARLY RETURN: full rep len={n} < 8")
         return ErrorDetection(eid, rep.rep_index, ErrorStatus.INSUFFICIENT_DATA,
-                              confidence=0.0, detail=f"完整 rep 轨迹长度不足: {end - start}")
+                              confidence=0.0, detail=f"完整 rep 轨迹长度不足: {n}")
 
     # ═══════════════════════════════════════════════════════════
-    # 3. 逐帧构造 bar proxy（mixed proxy）
+    # 3. 计算各侧有效率，决定 proxy 模式（和 V7 一样）
     # ═══════════════════════════════════════════════════════════
     l_seg = left[start:end] if left is not None else None
     r_seg = right[start:end] if right is not None else None
-
-    n = end - start
-    bar = np.full((n, 2), np.nan, dtype=float)
 
     left_valid = np.zeros(n, dtype=bool)
     right_valid = np.zeros(n, dtype=bool)
@@ -687,53 +685,60 @@ def detect_bar_path(rep: RepContext) -> ErrorDetection:
     if r_seg is not None:
         right_valid = np.isfinite(r_seg[:, 0]) & np.isfinite(r_seg[:, 1])
 
-    # 双腕 -> midpoint
     both = left_valid & right_valid
-    if np.any(both):
+    left_ratio = float(np.mean(left_valid))
+    right_ratio = float(np.mean(right_valid))
+    both_ratio = float(np.mean(both))
+
+    print(f"   🛤️   left={left_ratio:.3f} right={right_ratio:.3f} both={both_ratio:.3f}")
+
+    # ═══════════════════════════════════════════════════════════
+    # 4. 根据 proxy 模式构建 bar 轨迹（和 V7 一样）
+    # ═══════════════════════════════════════════════════════════
+    bar = np.full((n, 2), np.nan, dtype=float)
+
+    if left_ratio >= 0.80 and l_seg is not None:
+        bar = l_seg.copy()
+        bar[~left_valid] = np.nan
+        proxy_mode = "left_wrist_only"
+        quality = 0.78
+        print(f"   🛤️   proxy=left_wrist_only (left={left_ratio:.3f}>=0.80)")
+    elif right_ratio >= 0.80 and r_seg is not None:
+        bar = r_seg.copy()
+        bar[~right_valid] = np.nan
+        proxy_mode = "right_wrist_only"
+        quality = 0.78
+        print(f"   🛤️   proxy=right_wrist_only (right={right_ratio:.3f}>=0.80)")
+    elif both_ratio >= 0.50:
         bar[both] = (l_seg[both] + r_seg[both]) / 2.0
-
-    # 只有左腕
-    left_only = left_valid & ~right_valid
-    if np.any(left_only):
-        bar[left_only] = l_seg[left_only]
-
-    # 只有右腕
-    right_only = right_valid & ~left_valid
-    if np.any(right_only):
-        bar[right_only] = r_seg[right_only]
+        proxy_mode = "bilateral_midpoint"
+        quality = 0.90
+        print(f"   🛤️   proxy=bilateral_midpoint (both={both_ratio:.3f}>=0.50)")
+    else:
+        if np.any(both):
+            bar[both] = (l_seg[both] + r_seg[both]) / 2.0
+        left_only = left_valid & ~right_valid
+        if np.any(left_only) and l_seg is not None:
+            bar[left_only] = l_seg[left_only]
+        right_only = right_valid & ~left_valid
+        if np.any(right_only) and r_seg is not None:
+            bar[right_only] = r_seg[right_only]
+        proxy_mode = "mixed_wrist_proxy"
+        quality = 0.60
+        print(f"   🛤️   proxy=mixed_wrist_proxy")
 
     bar_valid = np.isfinite(bar[:, 0]) & np.isfinite(bar[:, 1])
     bar_valid_ratio = float(np.mean(bar_valid))
-    both_ratio = float(np.mean(both))
-    left_ratio = float(np.mean(left_valid))
-    right_ratio = float(np.mean(right_valid))
-
-    print(f"   🛤️   left={left_ratio:.3f} right={right_ratio:.3f} "
-          f"both={both_ratio:.3f} bar_proxy={bar_valid_ratio:.3f} "
-          f"valid_frames={int(bar_valid.sum())}/{n}")
+    print(f"   🛤️   bar_valid={int(bar_valid.sum())}/{n} ({bar_valid_ratio:.3f})")
 
     if bar_valid.sum() < 8:
         print(f"   ❌ [BarPath] EARLY RETURN: 有效 bar proxy={int(bar_valid.sum())} < 8")
-        return ErrorDetection(
-            eid, rep.rep_index, ErrorStatus.INSUFFICIENT_DATA, confidence=0.0,
-            detail=f"有效 bar proxy 帧不足: {int(bar_valid.sum())}/{n}",
-        )
-
-    # proxy_mode 三档
-    if both_ratio >= 0.50:
-        proxy_mode = "bilateral_midpoint"
-        quality = 0.90
-    elif bar_valid_ratio >= 0.65:
-        proxy_mode = "mixed_wrist_proxy"
-        quality = 0.68
-    else:
-        proxy_mode = "sparse_wrist_proxy"
-        quality = 0.50
+        return ErrorDetection(eid, rep.rep_index, ErrorStatus.INSUFFICIENT_DATA, confidence=0.0,
+                              detail=f"有效 bar proxy 帧不足: {int(bar_valid.sum())}/{n}")
 
     # ═══════════════════════════════════════════════════════════
-    # 3.5 中值滤波 + 速度门控（去除 mixed proxy 左右切换跳变）
+    # 5. 线性插值填充 NaN
     # ═══════════════════════════════════════════════════════════
-    # 先线性插值填充 NaN（用于中值滤波和速度门控）
     bar_interp = bar.copy()
     for col in range(2):
         valid = np.isfinite(bar_interp[:, col])
@@ -742,264 +747,298 @@ def detect_bar_path(rep: RepContext) -> ErrorDetection:
                 np.arange(n), np.where(valid)[0], bar_interp[valid, col]
             )
 
-    # 3 点中值滤波（去除左右切换跳变）
-    def _median_filter_1d(x, kernel=3):
-        result = x.copy()
-        half = kernel // 2
-        for i in range(len(x)):
-            lo = max(0, i - half)
-            hi = min(len(x), i + half + 1)
-            window = x[lo:hi]
-            if len(window) > 0:
-                result[i] = np.median(window)
-        return result
-
-    bar_filtered = np.column_stack([
-        _median_filter_1d(bar_interp[:, 0], 3),
-        _median_filter_1d(bar_interp[:, 1], 3),
-    ])
-
-    # 速度门控：去除不连续跳点（位移 > 0.20 * 估计尺度）
-    # 先用 bar x 的 IQR 估计尺度（避免依赖 shoulder_width）
-    x_iqr = float(np.percentile(bar_filtered[:, 0], 75) -
-                   np.percentile(bar_filtered[:, 0], 25))
-    speed_threshold = max(0.20 * x_iqr, 5.0)  # 至少 5 像素
-
-    jump_count = 0
-    for i in range(1, n):
-        if abs(bar_filtered[i, 0] - bar_filtered[i-1, 0]) > speed_threshold:
-            # 用前后值的平均替换跳点
-            bar_filtered[i, 0] = (bar_filtered[i-1, 0] + bar_filtered[min(i+1, n-1), 0]) / 2
-            bar_filtered[i, 1] = (bar_filtered[i-1, 1] + bar_filtered[min(i+1, n-1), 1]) / 2
-            jump_count += 1
-
-    print(f"   🛤️   median_filter + speed_gate: jumps_removed={jump_count}, "
-          f"speed_threshold={speed_threshold:.1f}px")
-
     # ═══════════════════════════════════════════════════════════
-    # 4. 逐帧肩部参考（shoulder_mid_x 数组）
+    # 6. 用 path_amplitude 归一化（而不是 shoulder_width）
+    #
+    # 侧视视频中 shoulder_width 很小（躯干长度仅12px），
+    # 1px MediaPipe 抖动就会被放大成 0.08。
+    # 用卧推本身的水平运动幅度作为尺度更稳定。
     # ═══════════════════════════════════════════════════════════
-    shoulder_mid_x = None
-    shoulder_width = None
-
-    if rep.left_shoulder is not None and rep.right_shoulder is not None:
-        ls = np.asarray(rep.left_shoulder, dtype=float)
-        rs = np.asarray(rep.right_shoulder, dtype=float)
-
-        if (ls.ndim == 2 and rs.ndim == 2
-                and ls.shape[1] >= 2 and rs.shape[1] >= 2):
-            ls_seg = ls[start:end]
-            rs_seg = rs[start:end]
-            shoulder_valid = (
-                np.isfinite(ls_seg[:, 0]) & np.isfinite(ls_seg[:, 1]) &
-                np.isfinite(rs_seg[:, 0]) & np.isfinite(rs_seg[:, 1])
-            )
-            if np.sum(shoulder_valid) >= 8:
-                shoulder_mid_x = (ls_seg[:, 0] + rs_seg[:, 0]) / 2.0
-                shoulder_width_signal = np.sqrt(
-                    (rs_seg[:, 0] - ls_seg[:, 0]) ** 2 +
-                    (rs_seg[:, 1] - ls_seg[:, 1]) ** 2
-                )
-                shoulder_width_signal[~shoulder_valid] = np.nan
-                shoulder_width = shoulder_width_signal
-
-    # fallback：肩部数据不足时退化
-    if shoulder_mid_x is None:
-        shoulder_mid_x = np.full(n, np.nanmedian(bar_filtered[:, 0]))
-
-    if shoulder_width is None:
-        if left is not None and right is not None:
-            grip = np.sqrt(
-                (left[start:end, 0] - right[start:end, 0]) ** 2 +
-                (left[start:end, 1] - right[start:end, 1]) ** 2
-            )
-            width = float(np.nanmedian(grip))
-        else:
-            width = x_iqr * 2.0
-        width = max(width, 10.0)
-        shoulder_width = np.full(n, width)
-    else:
-        shoulder_width = np.asarray(shoulder_width, dtype=float)
-        fallback_w = np.nanmedian(shoulder_width)
-        shoulder_width[~np.isfinite(shoulder_width) | (shoulder_width < 5.0)] = fallback_w
-        shoulder_width[~np.isfinite(shoulder_width)] = 10.0
-
-    # ═══════════════════════════════════════════════════════════
-    # 5. 逐帧 body-relative position + 真实时间轴
-    # ═══════════════════════════════════════════════════════════
-    x_relative = (bar_filtered[:, 0] - shoulder_mid_x) / np.maximum(shoulder_width, 10.0)
-
-    # 保留 frame index，用于真实时间轴
-    frame_idx = np.arange(start, end)
-    valid_idx = frame_idx  # bar_filtered 已经插值，全部有效
-    x = x_relative  # 已经全部有效（插值后）
-
-    # 真实时间轴
-    t_full = (valid_idx - valid_idx[0]) / max(valid_idx[-1] - valid_idx[0], 1)
-
-    print(f"   🛤️   time_axis: {len(x)} points, span={valid_idx[-1] - valid_idx[0]} frames")
-
-    # ═══════════════════════════════════════════════════════════
-    # 6. 7点移动平均平滑
-    # ═══════════════════════════════════════════════════════════
-    if len(x) >= 7:
-        kernel = np.ones(7, dtype=float) / 7.0
-        padded = np.pad(x, (3, 3), mode="edge")
-        x_smooth = np.convolve(padded, kernel, mode="valid")
-    else:
-        x_smooth = x.copy()
-
-    # ═══════════════════════════════════════════════════════════
-    # 7. Path Offset（相对于肩中线的绝对偏移，辅助证据）
-    # ═══════════════════════════════════════════════════════════
-    abs_x = np.abs(x_smooth)
-    p90_offset = float(np.percentile(abs_x, 90))
-    max_offset = float(np.max(abs_x))
-
-    OFFSET_MODERATE = 0.30
-    OFFSET_SEVERE = 0.40
-    offset_moderate = p90_offset >= OFFSET_MODERATE
-    offset_severe = p90_offset >= OFFSET_SEVERE
-
-    # ═══════════════════════════════════════════════════════════
-    # 8. Wobble（横向反复摆动）
-    # ═══════════════════════════════════════════════════════════
-    dx = np.diff(x_smooth)
-    if len(dx) < 3:
-        print("   ❌ [BarPath] EARLY RETURN: 轨迹点不足")
-        return ErrorDetection(eid, rep.rep_index, ErrorStatus.INSUFFICIENT_DATA,
-                              confidence=0.0, detail="轨迹点不足")
-
-    total_variation = float(np.sum(np.abs(dx)))
-    net_shift = float(abs(x_smooth[-1] - x_smooth[0]))
-    wobble = max(0.0, total_variation - net_shift)
-
-    WOBBLE_MODERATE = 0.08
-    WOBBLE_SEVERE = 0.14
-    wobble_moderate = wobble >= WOBBLE_MODERATE
-    wobble_severe = wobble >= WOBBLE_SEVERE
-
-    # ═══════════════════════════════════════════════════════════
-    # 9. 方向反转计数
-    # ═══════════════════════════════════════════════════════════
-    DIFF_EPS = 0.008
-    signs = np.zeros_like(dx)
-    signs[dx > DIFF_EPS] = 1
-    signs[dx < -DIFF_EPS] = -1
-    nz = signs[signs != 0]
-    reversal_count = 0
-    if len(nz) >= 2:
-        reversal_count = int(np.sum(nz[1:] != nz[:-1]))
-
-    REVERSAL_MODERATE = 4
-    REVERSAL_SEVERE = 7
-    reversal_moderate = reversal_count >= REVERSAL_MODERATE
-    reversal_severe = reversal_count >= REVERSAL_SEVERE
-
-    # ═══════════════════════════════════════════════════════════
-    # 10. Reference Path Corridor（二次拟合残差，使用真实时间轴）
-    # ═══════════════════════════════════════════════════════════
-    try:
-        coef = np.polyfit(t_full, x_smooth, deg=2)
-        fitted = np.polyval(coef, t_full)
-        residual_rms = float(np.sqrt(np.mean((x_smooth - fitted) ** 2)))
-        residual_peak = float(np.max(np.abs(x_smooth - fitted)))
-    except Exception:
-        residual_rms = np.inf
-        residual_peak = np.inf
-
-    RESIDUAL_MODERATE = 0.045
-    RESIDUAL_SEVERE = 0.075
-    residual_moderate = residual_rms >= RESIDUAL_MODERATE
-    residual_severe = residual_rms >= RESIDUAL_SEVERE
-
-    # ═══════════════════════════════════════════════════════════
-    # 11. 多证据综合
-    # ═══════════════════════════════════════════════════════════
-    moderate_evidence = sum([offset_moderate, wobble_moderate, reversal_moderate, residual_moderate])
-    severe_evidence = sum([offset_severe, wobble_severe, reversal_severe, residual_severe])
-
-    other_dynamic = wobble_moderate or reversal_moderate or residual_moderate
-    other_severe = wobble_severe or reversal_severe or residual_severe
-
-    # ═══════════════════════════════════════════════════════════
-    # 12. 诊断日志（详细指标）
-    # ═══════════════════════════════════════════════════════════
-    print(f"   🛤️   proxy={proxy_mode} quality={quality:.2f}")
-    print(f"   🛤️   p90_offset={p90_offset:.3f} "
-          f"{'[SEVERE]' if offset_severe else '[MODERATE]' if offset_moderate else '[NORMAL]'}")
-    print(f"   🛤️   max_offset={max_offset:.3f}")
-    print(f"   🛤️   net_shift={net_shift:.3f}")
-    print(f"   🛤️   wobble={wobble:.3f} "
-          f"{'[SEVERE]' if wobble_severe else '[MODERATE]' if wobble_moderate else '[NORMAL]'}")
-    print(f"   🛤️   residual={residual_rms:.3f} (peak={residual_peak:.3f}) "
-          f"{'[SEVERE]' if residual_severe else '[MODERATE]' if residual_moderate else '[NORMAL]'}")
-    print(f"   🛤️   reversals={reversal_count} "
-          f"{'[SEVERE]' if reversal_severe else '[MODERATE]' if reversal_moderate else '[NORMAL]'}")
-    print(f"   🛤️   evidence={moderate_evidence}/{severe_evidence}")
-
-    # ═══════════════════════════════════════════════════════════
-    # 13. 判定
-    # ═══════════════════════════════════════════════════════════
-    detail = (
-        f"proxy={proxy_mode}, p90_offset={p90_offset:.3f}, "
-        f"max_offset={max_offset:.3f}, net_shift={net_shift:.3f}, "
-        f"wobble={wobble:.3f}, residual={residual_rms:.3f}, "
-        f"reversals={reversal_count}, bar_valid={bar_valid_ratio:.2f}, "
-        f"jumps_removed={jump_count}"
+    x_raw = bar_interp[:, 0]
+    path_amplitude = float(
+        np.percentile(x_raw, 95) - np.percentile(x_raw, 5)
     )
 
-    # Severe：至少两类强证据
-    if severe_evidence >= 2:
-        print("   🛤️   → SEVERE (多类强证据)")
+    # 如果水平运动幅度太小（<10px），可能是正面视频，用 shoulder_width fallback
+    if path_amplitude < 10.0:
+        if rep.left_shoulder is not None and rep.right_shoulder is not None:
+            ls = np.asarray(rep.left_shoulder, dtype=float)
+            rs = np.asarray(rep.right_shoulder, dtype=float)
+            if ls.ndim == 2 and rs.ndim == 2 and ls.shape[1] >= 2:
+                sw = np.median(np.sqrt(
+                    (rs[start:end, 0] - ls[start:end, 0]) ** 2 +
+                    (rs[start:end, 1] - ls[start:end, 1]) ** 2
+                ))
+                if np.isfinite(sw) and sw > 5.0:
+                    path_amplitude = sw
+                    print(f"   🛤️   path_amplitude太小，用shoulder_width={sw:.1f}px替代")
+
+    path_amplitude = max(path_amplitude, 10.0)
+
+    # 归一化到 [-0.5, 0.5] 范围（median 为 0）
+    x_median = float(np.median(x_raw))
+    x_norm = (x_raw - x_median) / path_amplitude
+
+    print(f"   🛤️   path_amplitude={path_amplitude:.1f}px")
+    print(f"   🛤️   x_norm range=[{x_norm.min():.3f}, {x_norm.max():.3f}]")
+
+    # ═══════════════════════════════════════════════════════════
+    # 7. 7点移动平均平滑
+    # ═══════════════════════════════════════════════════════════
+    if len(x_norm) >= 7:
+        kernel = np.ones(7, dtype=float) / 7.0
+        padded = np.pad(x_norm, (3, 3), mode="edge")
+        x_smooth = np.convolve(padded, kernel, mode="valid")
+    else:
+        x_smooth = x_norm.copy()
+
+    # ═══════════════════════════════════════════════════════════
+    # 8. 分阶段：eccentric / concentric
+    # ═══════════════════════════════════════════════════════════
+    # 相对索引（相对于 rep 起始，已经去掉了前后各1帧，所以需要调整）
+    # start 已经是去掉前1帧后的索引，所以相对索引 = 原始索引 - start
+    # 但 rep.start_frame 是原始帧号，bar 数组是从 rep.start_frame 开始的
+    # 所以 bar[i] 对应帧号 = rep.start_frame + i + (1 if 去掉了前1帧 else 0)
+
+    # 简化：用 bottom_frame 和 concentric_start 作为分界
+    bottom_rel = None
+    if hasattr(rep, 'bottom_frame') and rep.bottom_frame is not None:
+        bottom_rel = rep.bottom_frame - rep.start_frame - start
+        if bottom_rel < 1 or bottom_rel >= n - 1:
+            bottom_rel = None
+
+    concentric_start_rel = None
+    if hasattr(rep, 'concentric_start') and rep.concentric_start is not None:
+        concentric_start_rel = rep.concentric_start - rep.start_frame - start
+        if concentric_start_rel < 1 or concentric_start_rel >= n - 1:
+            concentric_start_rel = None
+
+    # 用 bottom_frame 作为分界点（更准确）
+    if bottom_rel is not None:
+        ecc_end = bottom_rel
+        con_start = bottom_rel
+    elif concentric_start_rel is not None:
+        ecc_end = concentric_start_rel
+        con_start = concentric_start_rel
+    else:
+        # fallback：用中间点
+        ecc_end = n // 2
+        con_start = n // 2
+
+    ecc_end = max(2, min(ecc_end, n - 2))
+    con_start = max(2, min(con_start, n - 2))
+
+    print(f"   🛤️   eccentric=[0:{ecc_end}] len={ecc_end}")
+    print(f"   🛤️   concentric=[{con_start}:{n}] len={n - con_start}")
+
+    # ═══════════════════════════════════════════════════════════
+    # 9. dead-zone 过滤 + 阶段分析
+    #
+    # EPS = max(0.015, 0.03 * path_amplitude_norm)
+    # 但 x_norm 已经归一化到 path_amplitude，所以 EPS 用相对值
+    # ═══════════════════════════════════════════════════════════
+    EPS = 0.015  # 1.5% of path_amplitude，小于这个幅度的变化视为 pose noise
+
+    def analyze_phase(x_phase, phase_name):
+        """分析一个阶段的横向运动稳定性。
+
+        Returns:
+            dict: {
+                'dominant_dir': 1 or -1,
+                'reverse_ratio': 反向帧占比,
+                'sustained_reversals': 持续≥3帧的反向运动段数,
+                'max_sustained_reverse': 最大持续反向段的累计位移,
+                'high_freq_wobble': 高频摆动次数（方向持续≥3帧的反转）,
+            }
+        """
+        if len(x_phase) < 4:
+            return {
+                'dominant_dir': 0, 'reverse_ratio': 0.0,
+                'sustained_reversals': 0, 'max_sustained_reverse': 0.0,
+                'high_freq_wobble': 0,
+            }
+
+        dx = np.diff(x_phase)
+
+        # dead-zone 过滤
+        dx_filtered = dx.copy()
+        dx_filtered[np.abs(dx_filtered) < EPS] = 0.0
+
+        # 主导方向（median sign）
+        nonzero_dx = dx_filtered[dx_filtered != 0]
+        if len(nonzero_dx) == 0:
+            dominant_dir = 0
+        else:
+            dominant_dir = 1 if np.median(nonzero_dx) > 0 else -1
+
+        # 反向帧占比
+        if dominant_dir == 0:
+            reverse_ratio = 0.0
+        else:
+            reverse_frames = np.sum(dx_filtered * dominant_dir < 0)
+            reverse_ratio = float(reverse_frames / max(len(dx_filtered), 1))
+
+        # 持续反向运动段（连续 ≥3 帧反向）
+        sustained_reversals = 0
+        max_sustained_reverse = 0.0
+        if dominant_dir != 0:
+            is_reverse = dx_filtered * dominant_dir < 0
+            # 找连续段
+            current_len = 0
+            current_sum = 0.0
+            for i in range(len(is_reverse)):
+                if is_reverse[i]:
+                    current_len += 1
+                    current_sum += abs(dx_filtered[i])
+                else:
+                    if current_len >= 3:
+                        sustained_reversals += 1
+                        max_sustained_reverse = max(max_sustained_reverse, current_sum)
+                    current_len = 0
+                    current_sum = 0.0
+            if current_len >= 3:
+                sustained_reversals += 1
+                max_sustained_reverse = max(max_sustained_reverse, current_sum)
+
+        # 高频摆动：方向持续 ≥3 帧的反转次数
+        high_freq_wobble = 0
+        signs = np.sign(dx_filtered)
+        signs = signs[signs != 0]
+        if len(signs) >= 4:
+            # 压缩连续相同符号
+            compressed = []
+            current_sign = signs[0]
+            current_len = 1
+            for i in range(1, len(signs)):
+                if signs[i] == current_sign:
+                    current_len += 1
+                else:
+                    if current_len >= 3:
+                        compressed.append(current_sign)
+                    current_sign = signs[i]
+                    current_len = 1
+            if current_len >= 3:
+                compressed.append(current_sign)
+
+            # 统计反转次数
+            for i in range(1, len(compressed)):
+                if compressed[i] != compressed[i-1]:
+                    high_freq_wobble += 1
+
+        return {
+            'dominant_dir': dominant_dir,
+            'reverse_ratio': reverse_ratio,
+            'sustained_reversals': sustained_reversals,
+            'max_sustained_reverse': max_sustained_reverse,
+            'high_freq_wobble': high_freq_wobble,
+        }
+
+    ecc_result = analyze_phase(x_smooth[:ecc_end], "eccentric")
+    con_result = analyze_phase(x_smooth[con_start:], "concentric")
+
+    print(f"   🛤️   [eccentric] dominant_dir={ecc_result['dominant_dir']} "
+          f"reverse_ratio={ecc_result['reverse_ratio']:.3f} "
+          f"sustained_rev={ecc_result['sustained_reversals']} "
+          f"max_reverse={ecc_result['max_sustained_reverse']:.3f} "
+          f"hf_wobble={ecc_result['high_freq_wobble']}")
+    print(f"   🛤️   [concentric] dominant_dir={con_result['dominant_dir']} "
+          f"reverse_ratio={con_result['reverse_ratio']:.3f} "
+          f"sustained_rev={con_result['sustained_reversals']} "
+          f"max_reverse={con_result['max_sustained_reverse']:.3f} "
+          f"hf_wobble={con_result['high_freq_wobble']}")
+
+    # ═══════════════════════════════════════════════════════════
+    # 10. 三个综合指标
+    # ═══════════════════════════════════════════════════════════
+
+    # 指标1：phase_monotonicity（阶段单调性）
+    # 两个阶段的反向帧占比都 < 30% 为正常
+    ecc_monotonic = ecc_result['reverse_ratio'] < 0.30
+    con_monotonic = con_result['reverse_ratio'] < 0.30
+    phase_monotonicity_ok = ecc_monotonic and con_monotonic
+    phase_monotonicity_severe = (
+        ecc_result['reverse_ratio'] >= 0.50 or
+        con_result['reverse_ratio'] >= 0.50
+    )
+
+    # 指标2：sustained_lateral_excursion（持续横向偏移）
+    # 两个阶段都没有持续 ≥3帧的反向运动为正常
+    ecc_sustained_ok = ecc_result['sustained_reversals'] == 0
+    con_sustained_ok = con_result['sustained_reversals'] == 0
+    sustained_ok = ecc_sustained_ok and con_sustained_ok
+    sustained_severe = (
+        ecc_result['max_sustained_reverse'] >= 0.15 or
+        con_result['max_sustained_reverse'] >= 0.15
+    )
+
+    # 指标3：high_frequency_wobble（高频摆动）
+    # 两个阶段的高频摆动都 < 2 为正常
+    ecc_hf_ok = ecc_result['high_freq_wobble'] < 2
+    con_hf_ok = con_result['high_freq_wobble'] < 2
+    hf_wobble_ok = ecc_hf_ok and con_hf_ok
+    hf_wobble_severe = (
+        ecc_result['high_freq_wobble'] >= 3 or
+        con_result['high_freq_wobble'] >= 3
+    )
+
+    # ═══════════════════════════════════════════════════════════
+    # 11. 诊断日志
+    # ═══════════════════════════════════════════════════════════
+    print(f"   🛤️   phase_monotonicity={'OK' if phase_monotonicity_ok else 'BAD'} "
+          f"(ecc_rev={ecc_result['reverse_ratio']:.2f}, con_rev={con_result['reverse_ratio']:.2f})")
+    print(f"   🛤️   sustained_excursion={'OK' if sustained_ok else 'BAD'} "
+          f"(ecc_sus={ecc_result['sustained_reversals']}, con_sus={con_result['sustained_reversals']})")
+    print(f"   🛤️   high_freq_wobble={'OK' if hf_wobble_ok else 'BAD'} "
+          f"(ecc_hf={ecc_result['high_freq_wobble']}, con_hf={con_result['high_freq_wobble']})")
+
+    # ═══════════════════════════════════════════════════════════
+    # 12. 判定
+    # ═══════════════════════════════════════════════════════════
+    abnormal_count = sum([
+        not phase_monotonicity_ok,
+        not sustained_ok,
+        not hf_wobble_ok,
+    ])
+    severe_count = sum([
+        phase_monotonicity_severe,
+        sustained_severe,
+        hf_wobble_severe,
+    ])
+
+    detail = (
+        f"proxy={proxy_mode}, path_amp={path_amplitude:.0f}px, "
+        f"ecc_rev_ratio={ecc_result['reverse_ratio']:.2f}, "
+        f"con_rev_ratio={con_result['reverse_ratio']:.2f}, "
+        f"ecc_sustained={ecc_result['sustained_reversals']}, "
+        f"con_sustained={con_result['sustained_reversals']}, "
+        f"ecc_hf={ecc_result['high_freq_wobble']}, "
+        f"con_hf={con_result['high_freq_wobble']}"
+    )
+
+    # Severe：至少 2 个强异常
+    if severe_count >= 2:
+        print(f"   🛤️   → SEVERE (severe_count={severe_count})")
         return ErrorDetection(
             eid, rep.rep_index, ErrorStatus.DETECTED, ErrorSeverity.SEVERE,
-            value=p90_offset, threshold=OFFSET_SEVERE, confidence=quality,
-            detail=f"杠铃轨迹明显偏离/不稳定: {detail}",
+            value=float(abnormal_count), threshold=2.0, confidence=quality,
+            detail=f"杠铃轨迹明显不稳定: {detail}",
         )
 
-    # Severe（备选）：offset_severe + 任何其他严重证据
-    if offset_severe and other_severe:
-        print("   🛤️   → SEVERE (大偏移+严重动态证据)")
-        return ErrorDetection(
-            eid, rep.rep_index, ErrorStatus.DETECTED, ErrorSeverity.SEVERE,
-            value=p90_offset, threshold=OFFSET_SEVERE, confidence=quality,
-            detail=f"杠铃轨迹大偏移+不稳定: {detail}",
-        )
-
-    # Moderate：offset_severe 单独可触发（避免纯粹平滑偏移漏检）
-    if offset_severe:
-        print("   🛤️   → MODERATE (大偏移，平滑)")
+    # Moderate：至少 2 个异常
+    if abnormal_count >= 2:
+        print(f"   🛤️   → MODERATE (abnormal_count={abnormal_count})")
         return ErrorDetection(
             eid, rep.rep_index, ErrorStatus.DETECTED, ErrorSeverity.MODERATE,
-            value=p90_offset, threshold=OFFSET_SEVERE, confidence=quality,
-            detail=f"杠铃轨迹整体偏移较大: {detail}",
-        )
-
-    # Moderate：offset_moderate + 任何其他动态/形状证据
-    if offset_moderate and other_dynamic:
-        print("   🛤️   → MODERATE (中等偏移+动态证据)")
-        return ErrorDetection(
-            eid, rep.rep_index, ErrorStatus.DETECTED, ErrorSeverity.MODERATE,
-            value=p90_offset, threshold=OFFSET_MODERATE, confidence=quality,
-            detail=f"杠铃轨迹偏移+不稳定: {detail}",
-        )
-
-    # Moderate：至少两类中等证据
-    if moderate_evidence >= 2:
-        print("   🛤️   → MODERATE (多类中等证据)")
-        return ErrorDetection(
-            eid, rep.rep_index, ErrorStatus.DETECTED, ErrorSeverity.MODERATE,
-            value=p90_offset, threshold=OFFSET_MODERATE, confidence=quality,
+            value=float(abnormal_count), threshold=2.0, confidence=quality,
             detail=f"杠铃轨迹存在不稳定: {detail}",
         )
 
     # Normal
-    print("   🛤️   → NORMAL")
+    print(f"   🛤️   → NORMAL (abnormal_count={abnormal_count})")
     return ErrorDetection(
         eid, rep.rep_index, ErrorStatus.NOT_DETECTED,
-        value=p90_offset, threshold=OFFSET_MODERATE, confidence=quality,
-        detail=f"杠铃轨迹未发现明显偏移: {detail}",
+        value=float(abnormal_count), threshold=2.0, confidence=quality,
+        detail=f"杠铃轨迹稳定（正常J型）: {detail}",
     )
 
 
