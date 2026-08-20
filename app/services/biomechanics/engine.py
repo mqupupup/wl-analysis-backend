@@ -550,7 +550,7 @@ class BiomechanicsEngine:
             by_severity[sev] = by_severity.get(sev, 0) + 1
 
         top_errors = []
-        for e in sorted(set_errors, key=lambda x: len(x.occurrences), reverse=True)[:3]:
+        for e in sorted(set_errors, key=lambda x: len(x.occurrences), reverse=True):
             top_errors.append({
                 "error_id": e.error_id,
                 "name_zh": e.display_name,

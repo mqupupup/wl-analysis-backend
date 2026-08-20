@@ -130,8 +130,13 @@ class PoseEstimator:
             return None
         lms = detection_result.pose_landmarks[0]
         landmarks_dict = {}
+        # wrist(15,16) 经常被杠铃/手背遮挡，使用更低的 visibility 阈值
+        WRIST_INDICES = {15, 16}
         for i, l in enumerate(lms):
-            if getattr(l, 'visibility', 1.0) > 0.3 and getattr(l, 'presence', 1.0) > 0.3:
+            vis = getattr(l, 'visibility', 1.0)
+            pres = getattr(l, 'presence', 1.0)
+            threshold = 0.15 if i in WRIST_INDICES else 0.3
+            if vis > threshold and pres > threshold:
                 landmarks_dict[i] = {'x': l.x, 'y': l.y, 'z': l.z}
         return landmarks_dict if len(landmarks_dict) >= 10 else None
 

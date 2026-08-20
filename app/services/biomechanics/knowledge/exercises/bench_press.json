@@ -541,6 +541,212 @@
                 "单臂绳索推胸",
                 "弱侧优先训练"
             ]
+        },
+        {
+            "id": "bench_eccentric_speed",
+            "name_zh": "离心速度失控",
+            "name_en": "Eccentric Speed Out of Control",
+            "severity": "medium",
+            "source_type": "heuristic",
+            "category": "dynamics",
+            "risk_note": [
+                "下放过快会增加底部冲击负荷，提高肩部和胸部受伤风险",
+                "失控的离心阶段会降低目标肌肉的张力持续时间，影响训练效果"
+            ],
+            "detect": {
+                "method": "eccentric_phase_velocity_stats",
+                "signals": [
+                    "eccentric_mean_speed (整个eccentric段 |elbow_velocity| 的mean)",
+                    "eccentric_peak_speed (整个eccentric段 |elbow_velocity| 的90th percentile)"
+                ],
+                "logic": {
+                    "severe": "peak_speed >= 300 °/s OR mean_speed >= 180 °/s",
+                    "moderate": "peak_speed >= 200 °/s OR mean_speed >= 120 °/s",
+                    "normal": "其他"
+                },
+                "note": "与bounce不同：bounce关注bottom前的approach speed，本项关注整个eccentric的速度控制"
+            },
+            "severity_levels": {
+                "moderate": {"threshold": "peak>=200 或 mean>=120 °/s", "score_penalty": -10, "penalty_type": "product_policy"},
+                "severe": {"threshold": "peak>=300 或 mean>=180 °/s", "score_penalty": -20, "penalty_type": "product_policy"}
+            },
+            "feedback_zh": "⚠️ 下放速度过快：离心阶段缺乏控制。建议有意识地放慢下放速度（2-3秒），感受胸肌拉伸，避免利用惯性砸到底部。",
+            "fix_exercises": [
+                "慢速离心卧推（3秒下放）",
+                "暂停卧推（底部停顿1-2秒）",
+                "轻重量技术组"
+            ]
+        },
+        {
+            "id": "bench_bar_path",
+            "name_zh": "杠铃轨迹不稳定",
+            "name_en": "Bar Path Instability",
+            "severity": "medium",
+            "source_type": "heuristic",
+            "category": "path",
+            "measurement_note": "当前使用 wrist_midpoint 作为杠铃轨迹代理。检测三个维度：(1) path_offset 杠铃相对于肩中线的异常横向偏移；(2) lateral_wobble 横向反复摆动/S型回摆；(3) path_shape 相对于二次平滑轨迹的残差+方向反转。正常J型位移不判错，但过大的解剖参考偏移会报错。",
+            "risk_note": [
+                "过大的横向偏移会增加肩部剪切力",
+                "S型横向摆动反映发力协调性不足",
+                "整体轨迹偏移可能导致发力线不对齐"
+            ],
+            "detect": {
+                "method": "wrist_midpoint_path_geometry_v6",
+                "version": "V6",
+                "signals": [
+                    "proxy_mode (bilateral_midpoint / mixed_wrist_proxy / sparse_wrist_proxy)",
+                    "quality (bilateral=0.90, mixed=0.68, sparse=0.50)",
+                    "bar_valid_ratio (逐帧mixed proxy的有效帧比例)",
+                    "left_valid_ratio / right_valid_ratio / both_valid_ratio",
+                    "frame_idx / valid_idx (真实时间轴，不等间距)",
+                    "median_filter (3点中值滤波，去除左右切换跳变)",
+                    "speed_gate (速度门控，位移>0.20*IQR的跳点被插值恢复)",
+                    "jumps_removed (速度门控去除的跳点数量)",
+                    "full_rep (完整rep分析，eccentric+concentric)",
+                    "path_offset_p90 (杠铃x相对于肩中线的90百分位绝对偏移，辅助证据)",
+                    "path_offset_max (杠铃x相对于肩中线的最大绝对偏移)",
+                    "lateral_wobble (total_variation - net_shift，横向反复摆动量)",
+                    "curve_residual_rms (reference path corridor，二次拟合RMS残差，使用真实时间轴)",
+                    "curve_residual_peak (二次拟合峰值残差)",
+                    "direction_reversals (横向方向反转次数，阈值0.8% shoulder_width)",
+                    "net_horizontal_shift (bottom→top净水平位移，不直接判错)"
+                ],
+                "logic": {
+                    "upstream_fix": "pose_estimation.py 对 wrist(15,16) 使用更低 visibility 阈值(0.15)，其他关节保持0.3，避免wrist被杠铃遮挡时大量NaN",
+                    "analysis_range": "完整 rep [start→end]，eccentric+concentric，去掉前后各1帧边界噪声。替代V5的仅concentric分析",
+                    "proxy_selection": {
+                        "bilateral_midpoint": "both_ratio>=0.50 → 双腕midpoint（置信度0.90）",
+                        "mixed_wrist_proxy": "both_ratio<0.50 但 bar_valid_ratio>=0.65 → 逐帧mixed（置信度0.68）",
+                        "sparse_wrist_proxy": "bar_valid_ratio<0.65 但 valid_frames>=8 → 稀疏mixed（置信度0.50）",
+                        "insufficient": "valid_frames<8 → INSUFFICIENT_DATA"
+                    },
+                    "mixed_proxy_strategy": "逐帧选择：both valid→midpoint, left only→left, right only→right, none→NaN",
+                    "preprocessing": [
+                        "线性插值填充NaN（用于中值滤波和速度门控）",
+                        "3点中值滤波（去除mixed proxy左右切换产生的人为跳变）",
+                        "速度门控：位移>0.20*IQR的跳点被前后值平均替换，线性插值恢复"
+                    ],
+                    "time_axis": "使用valid_idx计算真实时间轴t，替代linspace(0,1,n)的等间距假设",
+                    "coordinate_mode": "逐帧 shoulder_mid_x（数组），不是固定median",
+                    "smoothing": "7点移动平均平滑",
+                    "dimensions": {
+                        "path_offset": "p90_abs_offset >= 0.30 moderate, >= 0.40 severe（辅助证据）",
+                        "lateral_wobble": "wobble >= 0.08 moderate, >= 0.14 severe",
+                        "path_shape": "residual >= 0.045 moderate, >= 0.075 severe; reversals >= 4 moderate, >= 7 severe（reference path corridor）"
+                    },
+                    "severe": [
+                        "severe_evidence >= 2 (至少两类强证据)",
+                        "offset_severe + 任何其他严重动态证据"
+                    ],
+                    "moderate": [
+                        "offset_severe 单独可触发 (避免纯粹平滑偏移漏检)",
+                        "offset_moderate + 任何其他动态/形状证据",
+                        "moderate_evidence >= 2 (至少两类中等证据)"
+                    ],
+                    "normal": "其他",
+                    "key_principle": "完整rep分析+中值滤波+速度门控，确保mixed proxy的左右切换不会产生人为轨迹跳变；reference path corridor用二次拟合残差检测偏离平滑轨迹的程度"
+                },
+                "at_phase": ["eccentric", "concentric"],
+                "v6_fixes": [
+                    "修复V5数据不足：上游pose_estimation.py对wrist(15,16)使用更低visibility阈值(0.15)，其他关节保持0.3。wrist经常被杠铃遮挡，visibility在0.1-0.3之间被0.3门控过滤掉",
+                    "修复V5分析范围过窄：V5仅分析concentric(31帧)，V6分析完整rep[eccentric+concentric]，与规格文件at_phase一致",
+                    "修复V5 mixed proxy跳变：V5逐帧选择left/right/midpoint，left-only和right-only坐标处于不同透视位置，直接拼接产生人为跳变。V6加3点中值滤波+速度门控去除跳变",
+                    "速度门控：位移>0.20*IQR的跳点被前后值平均替换，jumps_removed记录去除数量",
+                    "reference path corridor改进：用完整rep的二次拟合作为参考曲线，计算actual vs fitted的residual_rms和residual_peak",
+                    "p90_offset保留为辅助证据（检测整体偏移），residual作为主要路径偏差指标",
+                    "去掉前后各1帧边界噪声，避免rep起始/结束帧的不稳定影响轨迹分析"
+                ],
+                "known_limitations": [
+                    "path_offset使用abs(bar_x - shoulder_mid_x)作为辅助证据，长期应升级为基于bottom/top的reference corridor（V7）",
+                    "使用wrist_midpoint作为bar proxy，非真实杠铃检测",
+                    "7点移动平均假设帧间距近似均匀，丢帧较多时可能有微小误差",
+                    "中值滤波和速度门控可能会平滑真实的快速运动，但kernel size=3影响较小",
+                    "sparse_wrist_proxy模式下置信度较低(0.50)，结果应标注为'疑似'",
+                    "上游wrist阈值降低(0.15)可能引入低质量wrist坐标，依赖中值滤波+速度门控过滤"
+                ]
+            },
+            "severity_levels": {
+                "moderate": {"threshold": "大偏移或多类中等证据", "score_penalty": -8, "penalty_type": "product_policy"},
+                "severe": {"threshold": "多类强证据或大偏移+严重动态证据", "score_penalty": -18, "penalty_type": "product_policy"}
+            },
+            "feedback_zh": "⚠️ 杠铃轨迹不稳定：推起过程中杠铃出现横向偏移、S型回摆或整体轨迹偏离身体参考轴。建议收紧肩胛、稳定上背，想象杠铃沿固定的J型轨迹运动。",
+            "fix_exercises": [
+                "板卧推（固定轨迹）",
+                "哑铃卧推（独立控制两侧）",
+                "轻重量技术组专注轨迹"
+            ]
+        },
+        {
+            "id": "bench_touch_point_drift",
+            "name_zh": "触胸位置漂移",
+            "name_en": "Touch Point Drift",
+            "severity": "low",
+            "source_type": "heuristic",
+            "category": "path",
+            "detection_level": "set",
+            "risk_note": [
+                "触胸点不一致反映动作模式不稳定",
+                "频繁变化的触胸点可能增加肩部压力"
+            ],
+            "detect": {
+                "method": "set_level_touch_point_variance",
+                "signals": [
+                    "touch_x_norm (bottom_frame时wrist_midpoint_x相对于shoulder中线的归一化值)",
+                    "touch_point_std (多rep的touch_x_norm的标准差)"
+                ],
+                "logic": {
+                    "severe": "touch_point_std >= 0.12 (>=3 reps)",
+                    "moderate": "touch_point_std >= 0.08 (>=3 reps)",
+                    "normal": "其他或reps<3"
+                },
+                "note": "这是set-level检测，不是单rep检测。单rep只计算touch_x_norm指标，drift判断在set聚合时做。"
+            },
+            "severity_levels": {
+                "moderate": {"threshold": "std>=0.08", "score_penalty": -5, "penalty_type": "product_policy"},
+                "severe": {"threshold": "std>=0.12", "score_penalty": -12, "penalty_type": "product_policy"}
+            },
+            "feedback_zh": "⚠️ 触胸位置不一致：每次杠铃触胸点有明显漂移。建议建立固定的触胸参考点（如下胸/中胸），每次都触到同一位置。",
+            "fix_exercises": [
+                "暂停卧推（底部明确触胸点）",
+                "板卧推（固定轨迹）",
+                "轻重量技术组专注一致性"
+            ]
+        },
+        {
+            "id": "bench_grip_width",
+            "name_zh": "握距不一致",
+            "name_en": "Grip Width Inconsistency",
+            "severity": "low",
+            "source_type": "heuristic",
+            "category": "path",
+            "detection_level": "set",
+            "risk_note": [
+                "握距变化会改变发力模式和肌肉参与比例",
+                "不一致的握距可能反映动作稳定性不足"
+            ],
+            "detect": {
+                "method": "set_level_grip_width_variance",
+                "signals": [
+                    "grip_width_norm (median(|left_wrist_x - right_wrist_x|) / shoulder_width)",
+                    "grip_width_cv (多rep的grip_width_norm的变异系数 = std/mean)"
+                ],
+                "logic": {
+                    "severe": "grip_width_cv >= 0.12 (>=3 reps)",
+                    "moderate": "grip_width_cv >= 0.08 (>=3 reps)",
+                    "normal": "其他或reps<3"
+                },
+                "note": "这是set-level检测。不判断'过宽/过窄'（个体差异大），只检测组内一致性。"
+            },
+            "severity_levels": {
+                "moderate": {"threshold": "CV>=0.08", "score_penalty": -5, "penalty_type": "product_policy"},
+                "severe": {"threshold": "CV>=0.12", "score_penalty": -10, "penalty_type": "product_policy"}
+            },
+            "feedback_zh": "⚠️ 握距不一致：组内握距有明显变化。建议每次握杠时确认握距一致（如用杠铃刻度标记），避免因疲劳导致握距收窄。",
+            "fix_exercises": [
+                "标记握距位置（胶带/刻度）",
+                "起杠前确认握距",
+                "疲劳组特别注意握距保持"
+            ]
         }
     ],
     "rep_detection": {
