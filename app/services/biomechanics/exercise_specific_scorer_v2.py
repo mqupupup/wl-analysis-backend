@@ -21,6 +21,7 @@ import warnings
 
 from app.domain.models import RepContext
 from app.domain.enums import ValidationStatus, MetricStatus
+from .butt_contact_analyzer import ButtContactAnalyzer
 
 
 # ═══════════════════════════════════════
@@ -97,8 +98,9 @@ MOVEMENT_WEIGHTS: Dict[str, float] = {
 }
 
 SAFETY_WEIGHTS: Dict[str, float] = {
-    "depth_control": 0.50,
-    "eccentric_control": 0.50,
+    "depth_control": 0.35,
+    "eccentric_control": 0.35,
+    "butt_contact": 0.30,
 }
 
 PERFORMANCE_WEIGHTS: Dict[str, float] = {
@@ -672,6 +674,58 @@ def compute_eccentric_control(rep: RepContext) -> MetricResult:
 
 
 # ═══════════════════════════════════════
+#  9b. Butt Contact — 臀部是否离凳（V1.1 Pose-only）
+# ═══════════════════════════════════════
+
+def compute_butt_contact(rep: RepContext) -> MetricResult:
+    """
+    V1.1: 臀部接触状态评分，调用 ButtContactAnalyzer。
+
+    评分映射：
+      normal_arch     → 100（正常起桥，臀部接触凳面）
+      suspected_lift  → 70（疑似臀部离凳，置信度 0.55~0.79）
+      confirmed_lift  → 40（高置信度臀部离凳模式，置信度 >=0.80）
+      insufficient_data → N/A（不扣分，自动从加权平均中剔除）
+
+    注意：这是 Safety 层的一个指标，不是错误检测。
+    错误检测层（detect_butt_off_bench）独立输出，不重复扣分。
+    """
+    analyzer = ButtContactAnalyzer()
+    result = analyzer.analyze(rep)
+
+    if result.status == "insufficient_data":
+        return MetricResult(
+            "butt_contact", None, None,
+            MetricStatus.INSUFFICIENT_DATA,
+            result.detail or "数据不足，无法判断臀部接触状态",
+        )
+
+    if result.status == "normal_arch":
+        score = 100.0
+    elif result.status == "suspected_lift":
+        # suspected 置信度 0.55~0.79，分数 60~80 线性映射
+        score = 60.0 + (result.confidence - 0.55) / (0.79 - 0.55) * 20.0
+    elif result.status == "confirmed_lift":
+        # confirmed 置信度 0.80~0.85，分数 30~50 线性映射
+        score = 30.0 + (result.confidence - 0.80) / (0.85 - 0.80) * 20.0
+    else:
+        score = 50.0  # 未知状态，给中间分
+
+    return MetricResult(
+        "butt_contact",
+        raw=result.max_relative_lift,
+        score=_clamp(score),
+        detail=(
+            f"status={result.status}, "
+            f"confidence={result.confidence:.2f}, "
+            f"max_lift={result.max_relative_lift}px, "
+            f"persistence={result.separated_frames}frames, "
+            f"reason={result.reason}"
+        ),
+    )
+
+
+# ═══════════════════════════════════════
 #  10. Concentric Speed（原 power，语义修正）
 # ═══════════════════════════════════════
 
@@ -760,6 +814,7 @@ class ExerciseSpecificScorerV2:
         safety_metrics = [
             compute_depth_control(rep),
             compute_eccentric_control(rep),
+            compute_butt_contact(rep),
         ]
         safety = aggregate_layer("safety", safety_metrics, SAFETY_WEIGHTS)
         result.layers["safety"] = safety
