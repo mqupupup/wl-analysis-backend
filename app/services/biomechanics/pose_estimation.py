@@ -94,6 +94,8 @@ class FramePoseData:
     positions_3d: Dict[str, List[float]] = field(default_factory=dict)
     world_landmarks: Dict[str, List[float]] = field(default_factory=dict)
     timestamp_sec: float = 0.0
+    # 低阈值 wrist 坐标（visibility>0.15），仅用于 BarPath 检测，不影响次数检测
+    wrist_positions_relaxed: Dict[str, List[float]] = field(default_factory=dict)
 
 
 class PoseEstimator:
@@ -130,13 +132,8 @@ class PoseEstimator:
             return None
         lms = detection_result.pose_landmarks[0]
         landmarks_dict = {}
-        # wrist(15,16) 经常被杠铃/手背遮挡，使用更低的 visibility 阈值
-        WRIST_INDICES = {15, 16}
         for i, l in enumerate(lms):
-            vis = getattr(l, 'visibility', 1.0)
-            pres = getattr(l, 'presence', 1.0)
-            threshold = 0.15 if i in WRIST_INDICES else 0.3
-            if vis > threshold and pres > threshold:
+            if getattr(l, 'visibility', 1.0) > 0.3 and getattr(l, 'presence', 1.0) > 0.3:
                 landmarks_dict[i] = {'x': l.x, 'y': l.y, 'z': l.z}
         return landmarks_dict if len(landmarks_dict) >= 10 else None
 
@@ -159,6 +156,28 @@ class PoseEstimator:
                 lm = world_lms[idx]
                 if getattr(lm, 'visibility', 1.0) > 0.3:
                     result[name] = [lm.x, lm.y, lm.z]
+        return result
+
+    @staticmethod
+    def _extract_wrist_relaxed(detection_result, frame_width, frame_height):
+        """低阈值提取 wrist 坐标（visibility>0.15），仅用于 BarPath 检测。
+
+        与 extract_landmarks_safe 不同，这个方法只提取 wrist(15,16)，
+        使用更低的 visibility 阈值(0.15)，因为 wrist 经常被杠铃/手背遮挡。
+        结果保存到 FramePoseData.wrist_positions_relaxed，BarPath 检测优先使用。
+        不影响次数检测（次数检测仍然使用 positions 中的标准阈值 wrist）。
+        """
+        if not detection_result or not detection_result.pose_landmarks:
+            return {}
+        lms = detection_result.pose_landmarks[0]
+        result = {}
+        for idx, name in [(15, 'left_wrist'), (16, 'right_wrist')]:
+            if idx < len(lms):
+                lm = lms[idx]
+                vis = getattr(lm, 'visibility', 1.0)
+                pres = getattr(lm, 'presence', 1.0)
+                if vis > 0.15 and pres > 0.15:
+                    result[name] = [lm.x * frame_width, lm.y * frame_height]
         return result
 
     # ================================================================
@@ -237,7 +256,7 @@ class PoseEstimator:
     # ================================================================
 
     def compute_frame_data(self, landmarks_dict, frame_idx, timestamp=0.0,
-                           world_landmarks_dict=None):
+                           world_landmarks_dict=None, wrist_positions_relaxed=None):
         fw, fh = self.frame_width, self.frame_height
 
         def get_px(idx):
@@ -361,7 +380,8 @@ class PoseEstimator:
             frame_idx=frame_idx, landmarks=landmarks_dict,
             angles=angles, positions=positions, positions_3d=positions_3d,
             world_landmarks=world_landmarks_dict or {},
-            timestamp_sec=timestamp
+            timestamp_sec=timestamp,
+            wrist_positions_relaxed=wrist_positions_relaxed or {},
         )
         
     @staticmethod
@@ -403,6 +423,7 @@ class PoseEstimator:
 
             lms = None
             world_lms = {}
+            wrist_relaxed = {}  # 低阈值 wrist，仅用于 BarPath，不影响次数检测
 
             # 优先使用 MediaPipe
             if self.engine == "mediapipe" and MEDIAPIPE_AVAILABLE and pose_landmarker:
@@ -411,6 +432,7 @@ class PoseEstimator:
                 res = pose_landmarker.detect(mp_image)
                 lms = self.extract_landmarks_safe(res)
                 world_lms = self.extract_world_landmarks(res)
+                wrist_relaxed = self._extract_wrist_relaxed(res, self.frame_width, self.frame_height)  # 低阈值 wrist
                 if lms:
                     mp_hits += 1
 
@@ -423,7 +445,7 @@ class PoseEstimator:
 
             if lms:
                 frame_data_list.append(
-                    self.compute_frame_data(lms, frame_idx, frame_idx / self.fps, world_lms))
+                    self.compute_frame_data(lms, frame_idx, frame_idx / self.fps, world_lms, wrist_relaxed))
 
             frame_idx += 1
 

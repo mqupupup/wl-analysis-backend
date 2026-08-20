@@ -432,6 +432,13 @@ class BiomechanicsEngine:
         }
 
         def _get_pos(fd, side):
+            # 优先使用低阈值 wrist（仅用于 BarPath，不影响次数检测）
+            relaxed = getattr(fd, "wrist_positions_relaxed", {}) or {}
+            for alias in WRIST_ALIASES[side]:
+                v = relaxed.get(alias)
+                if v is not None and len(v) >= 2:
+                    return float(v[0]), float(v[1])
+            # fallback：使用标准 positions（次数检测用的也是这个）
             positions = getattr(fd, "positions", {}) or {}
             for alias in WRIST_ALIASES[side]:
                 v = positions.get(alias)
