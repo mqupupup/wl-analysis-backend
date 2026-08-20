@@ -241,57 +241,182 @@ def detect_elbow_flare(rep: RepContext) -> ErrorDetection:
     )
 
 
-def detect_bounce(rep: RepContext) -> ErrorDetection:
-    """砸胸检测 — 多信号联合判断"""
+def detect_bounce(rep: RepContext, verbose: bool = True) -> ErrorDetection:
+    """
+    V3.1 Bounce Detector — 修复 4 个物理语义 Bug。
+
+    Args:
+        rep: RepContext
+        verbose: 是否输出诊断日志（评分层调用时传 False 避免重复输出）
+
+    修复内容：
+      1. pre_bottom_velocity: 卧推下放时 velocity < 0，PhaseBuilder 已取负号，
+         现在 fast_approach = pre_bottom_velocity >= 180 是正确的。
+      2. bottom_acceleration: PhaseBuilder 已改为真正的二阶导数 (°/s²)。
+      3. direction_reversal_frames: PhaseBuilder 已改为真正计算反转帧数。
+      4. bottom_dwell_time: PhaseBuilder 已改为基于 near-zero velocity 的真实 dwell。
+
+    核心思想：Bounce != Touch & Go
+      Bounce 需要同时出现：快速接近 + 极短停留 + 极快反转 + 异常加速度
+      Touch & Go: 正常接近速度 + 短停留 + 快速反转（但没有撞击反弹）
+    """
     eid = "bench_bounce"
 
-    if rep.pre_bottom_velocity is None:
+    # ── 数据可用性检查 ──
+    if rep.pre_bottom_velocity is None or not np.isfinite(rep.pre_bottom_velocity):
         return ErrorDetection(eid, rep.rep_index, ErrorStatus.INSUFFICIENT_DATA,
-                              detail="无 bottom 前速度数据")
+                              detail="缺少 bottom 前接近速度")
 
-    PRE_VEL_THRESH = 180.0
-    DWELL_THRESH = 0.08
-    REVERSAL_THRESH = 2
-    ACCEL_THRESH = 3000.0
+    approach_speed = float(rep.pre_bottom_velocity)
+    dwell = float(rep.bottom_dwell_time) if rep.bottom_dwell_time is not None and np.isfinite(rep.bottom_dwell_time) else np.nan
+    reversal_frames = int(rep.direction_reversal_frames) if rep.direction_reversal_frames is not None else 999
+    acceleration = float(rep.bottom_acceleration) if (rep.bottom_acceleration is not None and np.isfinite(rep.bottom_acceleration)) else np.nan
 
-    signals_hit = 0
+    # ── 计算 rebound_ratio（反弹比）：post_speed / pre_speed ──
+    rebound_ratio = _compute_rebound_ratio(rep)
+
+    # ── 信号 1: 快速接近 ──
+    fast_approach = approach_speed >= 180.0
+    approach_label = "[FAST]" if fast_approach else "[NORMAL]"
+
+    # ── 信号 2: 极短底部停留 ──
+    short_dwell = np.isfinite(dwell) and dwell <= 0.08
+    dwell_label = "[SHORT]" if short_dwell else "[NORMAL]"
+
+    # ── 信号 3: 快速方向反转 ──
+    rapid_reversal = reversal_frames <= 2
+    reversal_label = "[RAPID]" if rapid_reversal else "[NORMAL]"
+
+    # ── 信号 4: 底部异常加速度 ──
+    high_accel = np.isfinite(acceleration) and abs(acceleration) >= 3000.0
+    accel_label = "[HIGH]" if high_accel else "[NORMAL]"
+
+    # ── 信号 5: 高反弹比（撞击后弹起）──
+    high_rebound = rebound_ratio is not None and rebound_ratio >= 0.85
+    rebound_label = "[HIGH]" if high_rebound else "[NORMAL]"
+
+    # ── 诊断日志 ──
+    if verbose:
+        print(f"\n   🔻 [Bounce V3.1] Rep {rep.rep_index} 诊断:")
+        print(f"   🔻   approach_speed = {approach_speed:.0f}°/s   {approach_label}")
+        if np.isfinite(dwell):
+            print(f"   🔻   bottom_dwell   = {dwell*1000:.0f}ms   {dwell_label}")
+        else:
+            print(f"   🔻   bottom_dwell   = N/A")
+        print(f"   🔻   reversal       = {reversal_frames}f   {reversal_label}")
+        if np.isfinite(acceleration):
+            print(f"   🔻   acceleration   = {acceleration:.0f}°/s²   {accel_label}")
+        else:
+            print(f"   🔻   acceleration   = N/A")
+        if rebound_ratio is not None:
+            print(f"   🔻   rebound_ratio  = {rebound_ratio:.2f}   {rebound_label}")
+        else:
+            print(f"   🔻   rebound_ratio  = N/A")
+
+    hits = sum([fast_approach, short_dwell, rapid_reversal, high_accel, high_rebound])
     details = []
-
-    fast_descent = rep.pre_bottom_velocity > PRE_VEL_THRESH
-    if fast_descent:
-        signals_hit += 1
-        details.append(f"pre_vel={rep.pre_bottom_velocity:.0f}°/s")
-
-    short_dwell = rep.bottom_dwell_time < DWELL_THRESH
+    if fast_approach:
+        details.append(f"approach={approach_speed:.0f}°/s")
     if short_dwell:
-        signals_hit += 1
-        details.append(f"dwell={rep.bottom_dwell_time * 1000:.0f}ms")
-
-    fast_reversal = rep.direction_reversal_frames <= REVERSAL_THRESH
-    if fast_reversal:
-        signals_hit += 1
-        details.append(f"reversal={rep.direction_reversal_frames}frames")
-
-    high_accel = (rep.bottom_acceleration is not None
-                  and abs(rep.bottom_acceleration) > ACCEL_THRESH)
+        details.append(f"dwell={dwell*1000:.0f}ms")
+    if rapid_reversal:
+        details.append(f"reversal={reversal_frames}f")
     if high_accel:
-        signals_hit += 1
-        details.append(f"accel={rep.bottom_acceleration:.0f}°/s²")
+        details.append(f"accel={abs(acceleration):.0f}°/s²")
+    if high_rebound:
+        details.append(f"rebound={rebound_ratio:.2f}")
 
-    if signals_hit >= 3:
-        return ErrorDetection(eid, rep.rep_index, ErrorStatus.DETECTED,
-                              ErrorSeverity.SEVERE, value=rep.pre_bottom_velocity,
-                              threshold=PRE_VEL_THRESH, confidence=0.9,
-                              detail="; ".join(details))
-    elif signals_hit == 2 and (fast_descent and (short_dwell or fast_reversal)):
-        return ErrorDetection(eid, rep.rep_index, ErrorStatus.DETECTED,
-                              ErrorSeverity.MODERATE, value=rep.pre_bottom_velocity,
-                              threshold=PRE_VEL_THRESH, confidence=0.75,
-                              detail="; ".join(details))
-    else:
-        return ErrorDetection(eid, rep.rep_index, ErrorStatus.NOT_DETECTED,
-                              value=rep.pre_bottom_velocity, confidence=0.7,
-                              detail="; ".join(details) if details else "正常触胸")
+    if verbose:
+        print(f"   🔻   signals = {hits}/5  →  ", end="")
+
+    # ═══════════════════════════════════════
+    # Severe Bounce: >=3 个信号命中
+    # ═══════════════════════════════════════
+    if hits >= 3:
+        if verbose:
+            print("SEVERE BOUNCE")
+        return ErrorDetection(
+            eid, rep.rep_index, ErrorStatus.DETECTED,
+            ErrorSeverity.SEVERE, value=approach_speed,
+            threshold=180.0, confidence=0.90,
+            detail="明显弹震: " + "; ".join(details),
+        )
+
+    # ═══════════════════════════════════════
+    # Moderate Bounce: fast_approach + 至少 1 个其他强烈信号
+    # ═══════════════════════════════════════
+    if fast_approach and (short_dwell or rapid_reversal or high_accel or high_rebound):
+        if verbose:
+            print("MODERATE BOUNCE")
+        return ErrorDetection(
+            eid, rep.rep_index, ErrorStatus.DETECTED,
+            ErrorSeverity.MODERATE, value=approach_speed,
+            threshold=180.0, confidence=0.75,
+            detail="疑似弹震: " + "; ".join(details),
+        )
+
+    # ═══════════════════════════════════════
+    # Touch & Go: 短停留 + 快速反转，但接近速度正常
+    # ═══════════════════════════════════════
+    if short_dwell and not fast_approach and rapid_reversal:
+        if verbose:
+            print("TOUCH & GO (正常)")
+        return ErrorDetection(
+            eid, rep.rep_index, ErrorStatus.NOT_DETECTED,
+            value=approach_speed, threshold=180.0, confidence=0.80,
+            detail="Touch & Go: " + "; ".join(details) if details else "正常触胸即起",
+        )
+
+    # ═══════════════════════════════════════
+    # Normal
+    # ═══════════════════════════════════════
+    if verbose:
+        print("NORMAL")
+    return ErrorDetection(
+        eid, rep.rep_index, ErrorStatus.NOT_DETECTED,
+        value=approach_speed, threshold=180.0, confidence=0.80,
+        detail="正常底部控制" + (": " + "; ".join(details) if details else ""),
+    )
+
+
+def _compute_rebound_ratio(rep: RepContext) -> Optional[float]:
+    """
+    V3.1: 计算反弹比 = post_bottom_speed / pre_bottom_speed。
+
+    用 rep.bilateral_elbow（rep-relative 角度序列）计算。
+    bottom 前 3 帧的 |velocity| median vs bottom 后 3 帧的 |velocity| median。
+    """
+    if rep.bilateral_elbow is None:
+        return None
+
+    angles = np.asarray(rep.bilateral_elbow, dtype=float)
+    if len(angles) < 7:
+        return None
+
+    bf_rel = rep.bottom_frame - rep.start_frame
+    if bf_rel <= 0 or bf_rel >= len(angles) - 1:
+        return None
+
+    vel = np.gradient(angles, 1.0 / rep.fps)
+
+    pre_start = max(0, bf_rel - 3)
+    pre_vel = vel[pre_start:bf_rel]
+    pre_vel = pre_vel[np.isfinite(pre_vel)]
+    if len(pre_vel) == 0:
+        return None
+    pre_speed = float(np.nanmedian(np.abs(pre_vel)))
+
+    post_end = min(len(vel), bf_rel + 4)
+    post_vel = vel[bf_rel + 1:post_end]
+    post_vel = post_vel[np.isfinite(post_vel)]
+    if len(post_vel) == 0:
+        return None
+    post_speed = float(np.nanmedian(np.abs(post_vel)))
+
+    if pre_speed <= 1e-6:
+        return 0.0
+
+    return float(post_speed / pre_speed)
 
 
 def detect_butt_off_bench(rep: RepContext) -> ErrorDetection:

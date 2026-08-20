@@ -1120,6 +1120,66 @@ class PhaseBuilder:
         self.min_rom_deg = min_rom_deg
         self.reject_rom_deg = reject_rom_deg
 
+    # ═══════════════════════════════════════
+    #  V3.1 Bounce 特征辅助方法
+    # ═══════════════════════════════════════
+
+    def _compute_bottom_dwell(self, angles: np.ndarray, bottom_idx: int) -> float:
+        """
+        V3.1: 基于 near-zero velocity 计算真实底部停留时间。
+        不再是固定窗口长度。
+
+        从 bottom_idx 向左右扩展，直到 |velocity| > 20°/s。
+        """
+        if len(angles) < 5 or bottom_idx <= 0 or bottom_idx >= len(angles) - 1:
+            return 0.0
+
+        vel = np.gradient(angles, 1.0 / self.fps)
+        PAUSE_VEL_THRESH = 20.0  # °/s
+
+        # 向左扩展
+        left = bottom_idx
+        while left > 0 and abs(vel[left - 1]) <= PAUSE_VEL_THRESH:
+            left -= 1
+
+        # 向右扩展
+        right = bottom_idx
+        while right < len(vel) - 1 and abs(vel[right + 1]) <= PAUSE_VEL_THRESH:
+            right += 1
+
+        return (right - left) / self.fps
+
+    def _compute_reversal_frames(self, angles: np.ndarray, bottom_idx: int) -> int:
+        """
+        V3.1: 真正计算方向反转用了多少帧。
+        找底部前最后一个明显下降帧 → 底部后第一个明显上升帧。
+
+        返回帧数间隔，999 表示无法计算。
+        """
+        if bottom_idx <= 0 or bottom_idx >= len(angles) - 1:
+            return 999
+
+        vel = np.gradient(angles, 1.0 / self.fps)
+
+        # 底部前最后一个明显下降帧（vel < -10）
+        pre_idx = None
+        for i in range(bottom_idx - 1, max(-1, bottom_idx - 8), -1):
+            if vel[i] < -10.0:
+                pre_idx = i
+                break
+
+        # 底部后第一个明显上升帧（vel > 10）
+        post_idx = None
+        for i in range(bottom_idx + 1, min(len(vel), bottom_idx + 10)):
+            if vel[i] > 10.0:
+                post_idx = i
+                break
+
+        if pre_idx is None or post_idx is None:
+            return 999
+
+        return max(0, post_idx - pre_idx - 1)
+
     def build(
         self,
         rep_index: int,
@@ -1178,12 +1238,14 @@ class PhaseBuilder:
 
         ecc_start, ecc_end = sf, bf
         con_start, con_end = bf, ef
+        # bot_zone 用于 phases 展示，不用于 dwell 计算
         bot_zone_start = max(sf, bf - int(0.1 * self.fps))
         bot_zone_end = min(ef, bf + int(0.1 * self.fps))
 
         ecc_dur = (ecc_end - ecc_start) / self.fps if ecc_end > ecc_start else 0.0
         con_dur = (con_end - con_start) / self.fps if con_end > con_start else 0.0
-        bot_dwell = (bot_zone_end - bot_zone_start) / self.fps if bot_zone_end > bot_zone_start else 0.0
+        # V3.1: 真正的 bottom dwell，基于 near-zero velocity，不再是固定窗口长度
+        bot_dwell = self._compute_bottom_dwell(angles, bf)
 
         ecc_vel = con_vel = None
         peak_ecc = peak_con = mean_con = None
@@ -1199,20 +1261,31 @@ class PhaseBuilder:
             peak_con = float(np.nanmax(con_vel))
             mean_con = float(np.nanmean(con_vel))
 
+        # V3.1: 修复 bounce 特征的物理语义
+        # 1. pre_bottom_velocity: 卧推下放时 elbow angle 下降，velocity < 0
+        #    取负号使快速下放为正值，用 median 抗 jitter
+        # 2. bottom_acceleration: 真正的二阶导数 d(velocity)/dt，单位 °/s²
+        # 3. direction_reversal_frames: 真正计算反转用了多少帧，不再是 0/1
         pre_bot_vel = bot_accel = None
-        dir_reversal = 0
+        dir_reversal = 999  # 默认值，表示无法计算
         if bf > 0 and bf < n - 1:
-            window = max(1, int(0.05 * self.fps))
+            window = max(2, int(0.05 * self.fps))
             pre_seg = angles[max(0, bf - window):bf]
-            post_seg = angles[bf:min(n, bf + window)]
+            post_seg = angles[bf:min(n, bf + window + 1)]
+
             if len(pre_seg) > 1:
-                pre_bot_vel = float(np.mean(np.gradient(pre_seg, 1.0 / self.fps)))
+                pre_vel_series = np.gradient(pre_seg, 1.0 / self.fps)
+                # 取负号：下放时 velocity < 0，快速下放 → pre_bottom_velocity > 0
+                pre_bot_vel = float(-np.nanmedian(pre_vel_series))
+
             if len(post_seg) > 1:
                 post_vel = np.gradient(post_seg, 1.0 / self.fps)
-                bot_accel = float(np.mean(post_vel))
-            if pre_bot_vel is not None and bot_accel is not None:
-                if pre_bot_vel < 0 and bot_accel > 0:
-                    dir_reversal = 1
+                # 真正的加速度 = d(velocity)/dt
+                post_accel = np.gradient(post_vel, 1.0 / self.fps)
+                bot_accel = float(np.nanmedian(post_accel))
+
+            # 真正计算方向反转帧数
+            dir_reversal = self._compute_reversal_frames(angles, bf)
 
         le_slice = right_elbow_slice = bilat_slice = None
         left_wrist_slice = right_wrist_slice = None

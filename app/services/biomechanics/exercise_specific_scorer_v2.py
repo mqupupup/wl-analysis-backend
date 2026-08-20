@@ -20,8 +20,9 @@ import numpy as np
 import warnings
 
 from app.domain.models import RepContext
-from app.domain.enums import ValidationStatus, MetricStatus
+from app.domain.enums import ValidationStatus, MetricStatus, ErrorStatus
 from .butt_contact_analyzer import ButtContactAnalyzer
+from .error_detection_engine import detect_bounce
 
 
 # ═══════════════════════════════════════
@@ -98,9 +99,10 @@ MOVEMENT_WEIGHTS: Dict[str, float] = {
 }
 
 SAFETY_WEIGHTS: Dict[str, float] = {
-    "depth_control": 0.35,
-    "eccentric_control": 0.35,
-    "butt_contact": 0.30,
+    "depth_control": 0.25,
+    "eccentric_control": 0.25,
+    "butt_contact": 0.25,
+    "bounce_control": 0.25,
 }
 
 PERFORMANCE_WEIGHTS: Dict[str, float] = {
@@ -238,24 +240,35 @@ def compute_tempo(rep: RepContext) -> MetricResult:
 # ═══════════════════════════════════════
 
 def compute_bottom_control(rep: RepContext) -> MetricResult:
+    """
+    V3.1: 底部控制评分，与 Bounce 语义解耦。
+
+    注意：Bounce（砸胸弹震）由错误检测层独立判断，这里只评底部停留控制。
+    极短停留 (<0.03s) 可能是 bounce，但不直接等同——需要结合 approach_speed 等信号。
+
+    评分区间：
+      <0.03s   极短停留，可能弹胸 → 70 分
+      0.03~0.10s  Touch & Go，可接受 → 90 分
+      0.10~0.35s  正常控制 → 100 分
+      0.35~0.50s  稍长停顿 → 95 分
+      >0.50s   过长（可能失败/粘滞）→ 扣分
+    """
     dwell = float(rep.bottom_dwell_time)
 
     if not np.isfinite(dwell):
         return MetricResult("bottom_control", None, None,
                             MetricStatus.INSUFFICIENT_DATA)
 
-    # 0.05~0.35s 正常控制
-    # <0.05s 可能弹胸
-    # 0.35~0.50s 稍长停顿
-    # >0.50s 过长（可能失败/粘滞）
-    if 0.05 <= dwell <= 0.35:
-        score = 100.0
-    elif dwell < 0.05:
-        score = 85.0
-    elif dwell <= 0.50:
+    if dwell < 0.03:
+        score = 70.0
+    elif dwell < 0.10:
         score = 90.0
+    elif dwell <= 0.35:
+        score = 100.0
+    elif dwell <= 0.50:
+        score = 95.0
     else:
-        score = max(60.0, 90.0 - (dwell - 0.50) * 40.0)
+        score = max(60.0, 95.0 - (dwell - 0.50) * 40.0)
 
     return MetricResult("bottom_control", raw=dwell, score=_clamp(score))
 
@@ -726,6 +739,63 @@ def compute_butt_contact(rep: RepContext) -> MetricResult:
 
 
 # ═══════════════════════════════════════
+#  9c. Bounce Control — 弹胸控制（Safety 层）
+# ═══════════════════════════════════════
+
+def compute_bounce_control(rep: RepContext) -> MetricResult:
+    """
+    V3.1: 弹胸控制评分，调用 detect_bounce（verbose=False 避免重复日志）。
+
+    评分映射：
+      Normal (NOT_DETECTED, 非 Touch&Go)  → 100
+      Touch & Go (NOT_DETECTED, detail含"Touch & Go") → 90（合法变式，轻度扣分）
+      Moderate Bounce (DETECTED + MODERATE) → 65
+      Severe Bounce (DETECTED + SEVERE) → 35
+      Insufficient Data → N/A（不扣分，自动从加权平均中剔除）
+
+    注意：这是 Safety 层的一个指标，和错误检测层的 detect_bounce 是独立通道。
+    错误检测层输出"检测到的问题"，评分层输出 0~100 分，不会重复扣分。
+    """
+    result = detect_bounce(rep, verbose=False)
+
+    if result.status == ErrorStatus.INSUFFICIENT_DATA:
+        return MetricResult(
+            "bounce_control", None, None,
+            MetricStatus.INSUFFICIENT_DATA,
+            result.detail or "数据不足，无法判断弹胸",
+        )
+
+    if result.status == ErrorStatus.NOT_DETECTED:
+        # 区分 Touch & Go 和 Normal
+        if result.detail and "Touch & Go" in result.detail:
+            score = 90.0
+            label = "touch_and_go"
+        else:
+            score = 100.0
+            label = "normal"
+    elif result.status == ErrorStatus.DETECTED:
+        if result.severity and result.severity.value == "severe":
+            score = 35.0
+            label = "severe_bounce"
+        elif result.severity and result.severity.value == "moderate":
+            score = 65.0
+            label = "moderate_bounce"
+        else:
+            score = 50.0
+            label = "bounce"
+    else:
+        score = 50.0
+        label = "unknown"
+
+    return MetricResult(
+        "bounce_control",
+        raw=result.value,
+        score=_clamp(score),
+        detail=f"{label}: {result.detail}",
+    )
+
+
+# ═══════════════════════════════════════
 #  10. Concentric Speed（原 power，语义修正）
 # ═══════════════════════════════════════
 
@@ -815,6 +885,7 @@ class ExerciseSpecificScorerV2:
             compute_depth_control(rep),
             compute_eccentric_control(rep),
             compute_butt_contact(rep),
+            compute_bounce_control(rep),
         ]
         safety = aggregate_layer("safety", safety_metrics, SAFETY_WEIGHTS)
         result.layers["safety"] = safety

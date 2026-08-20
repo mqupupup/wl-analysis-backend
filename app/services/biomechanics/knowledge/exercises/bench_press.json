@@ -370,8 +370,27 @@
                 "利用弹力反弹会降低目标肌肉的张力持续时间"
             ],
             "detect": {
-                "method": "bottom_velocity",
-                "condition": "velocity_at_bottom > threshold AND bottom_pause_frames < 3",
+                "method": "multi_signal_bottom_impact",
+                "signals": [
+                    "approach_speed (pre_bottom_velocity, 卧推下放时已取负号使快速下放为正值)",
+                    "bottom_dwell_time (基于 near-zero velocity 的真实停留时间，不再是固定窗口长度)",
+                    "direction_reversal_frames (真正计算方向反转用了多少帧，不再是 0/1)",
+                    "bottom_acceleration (真正的二阶导数 d(velocity)/dt，单位 °/s²)",
+                    "rebound_ratio (post_bottom_speed / pre_bottom_speed，撞击反弹比)"
+                ],
+                "logic": {
+                    "severe": ">=3 个信号命中",
+                    "moderate": "fast_approach AND 至少 1 个其他强烈信号",
+                    "touch_and_go": "short_dwell AND NOT fast_approach AND rapid_reversal (正常训练变式，不报错)",
+                    "normal": "其他情况"
+                },
+                "thresholds": {
+                    "approach_speed": ">=180 °/s",
+                    "bottom_dwell": "<=0.08s",
+                    "reversal_frames": "<=2",
+                    "acceleration": ">=3000 °/s²",
+                    "rebound_ratio": ">=0.85"
+                },
                 "at_frame": "bottom"
             },
             "severity_levels": {
