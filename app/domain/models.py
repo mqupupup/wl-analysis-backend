@@ -73,6 +73,15 @@ class RepContext:
     bottom_acceleration: Optional[float] = None
     direction_reversal_frames: int = 0
 
+    # ── V3.3 Bounce 动力学（对称宽窗口 + peak speed，避开极值点） ──
+    pre_bottom_peak_speed: Optional[float] = None   # bottom 前 85th percentile |velocity|
+    post_bottom_peak_speed: Optional[float] = None  # bottom 后 85th percentile |velocity|
+    impact_recovery_ratio: Optional[float] = None   # post_peak / pre_peak（>=0.50 可疑）
+    velocity_drop_ratio: Optional[float] = None     # 1 - recovery_ratio
+
+    # ── V3.4 Bounce 动力学（反弹恢复延迟） ──
+    rebound_latency_frames: Optional[int] = None    # bottom→向心速度达pre_peak*40%所需帧数（<=3可疑）（<=0.25 可疑）
+
     # ── Rep-relative 双侧信号 ──
     left_elbow: Optional[np.ndarray] = None
     right_elbow: Optional[np.ndarray] = None

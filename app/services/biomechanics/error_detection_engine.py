@@ -243,180 +243,203 @@ def detect_elbow_flare(rep: RepContext) -> ErrorDetection:
 
 def detect_bounce(rep: RepContext, verbose: bool = True) -> ErrorDetection:
     """
-    V3.1 Bounce Detector — 修复 4 个物理语义 Bug。
+    V3.4 Bounce Detector — 多证据评分：高速接近 + 高速恢复 + 快速反弹 + 短停留。
+
+    V3.4 核心修复（解决 V3.3 漏检）：
+      1. recovery 门槛从 0.75 降到 0.50（high）/ 0.65（extreme）。
+         V3.3 要求 recovery>=0.75 太苛刻，导致 462°/s+0ms+1f 被判成 Touch&Go。
+      2. approach 门槛从 180/250 改成 300/400（用 peak speed）。
+      3. 新增 rebound_latency_frames（bottom→向心速度达pre_peak*40%所需帧数），
+         比 direction_reversal_frames（只判断方向是否反转）强很多。
+      4. 用 impact_score 多证据评分，不再依赖单一 recovery ratio 硬门槛。
+      5. 产品文案用"疑似砸胸/弹胸"而非"确认砸胸"（单目2D无法真正证明撞击）。
+
+    判定逻辑：
+      Severe   = fast_approach(>=400) + high_recovery(>=0.50) + (rapid_rebound or (short_dwell and rapid_reversal)) + impact_score>=6
+      Moderate = moderate_approach(>=300) + high_recovery(>=0.50) + (rapid_rebound or (short_dwell and rapid_reversal)) + impact_score>=4
+      Touch&Go = short_dwell + rapid_reversal + NOT high_recovery + approach<400
+      Normal   = 其他
 
     Args:
         rep: RepContext
         verbose: 是否输出诊断日志（评分层调用时传 False 避免重复输出）
-
-    修复内容：
-      1. pre_bottom_velocity: 卧推下放时 velocity < 0，PhaseBuilder 已取负号，
-         现在 fast_approach = pre_bottom_velocity >= 180 是正确的。
-      2. bottom_acceleration: PhaseBuilder 已改为真正的二阶导数 (°/s²)。
-      3. direction_reversal_frames: PhaseBuilder 已改为真正计算反转帧数。
-      4. bottom_dwell_time: PhaseBuilder 已改为基于 near-zero velocity 的真实 dwell。
-
-    核心思想：Bounce != Touch & Go
-      Bounce 需要同时出现：快速接近 + 极短停留 + 极快反转 + 异常加速度
-      Touch & Go: 正常接近速度 + 短停留 + 快速反转（但没有撞击反弹）
     """
     eid = "bench_bounce"
 
-    # ── 数据可用性检查 ──
-    if rep.pre_bottom_velocity is None or not np.isfinite(rep.pre_bottom_velocity):
-        return ErrorDetection(eid, rep.rep_index, ErrorStatus.INSUFFICIENT_DATA,
-                              detail="缺少 bottom 前接近速度")
+    # ── 数据可用性检查：优先用 V3.4 peak speed ──
+    if rep.pre_bottom_peak_speed is None or not np.isfinite(rep.pre_bottom_peak_speed):
+        # fallback 到旧字段
+        if rep.pre_bottom_velocity is None or not np.isfinite(rep.pre_bottom_velocity):
+            return ErrorDetection(eid, rep.rep_index, ErrorStatus.INSUFFICIENT_DATA,
+                                  detail="缺少 bottom 前接近速度")
+        approach = float(rep.pre_bottom_velocity)
+    else:
+        approach = float(rep.pre_bottom_peak_speed)
 
-    approach_speed = float(rep.pre_bottom_velocity)
-    dwell = float(rep.bottom_dwell_time) if rep.bottom_dwell_time is not None and np.isfinite(rep.bottom_dwell_time) else np.nan
-    reversal_frames = int(rep.direction_reversal_frames) if rep.direction_reversal_frames is not None else 999
-    acceleration = float(rep.bottom_acceleration) if (rep.bottom_acceleration is not None and np.isfinite(rep.bottom_acceleration)) else np.nan
+    post_peak = (
+        float(rep.post_bottom_peak_speed)
+        if rep.post_bottom_peak_speed is not None and np.isfinite(rep.post_bottom_peak_speed)
+        else None
+    )
+    recovery = (
+        float(rep.impact_recovery_ratio)
+        if rep.impact_recovery_ratio is not None and np.isfinite(rep.impact_recovery_ratio)
+        else None
+    )
+    latency = (
+        int(rep.rebound_latency_frames)
+        if getattr(rep, "rebound_latency_frames", None) is not None
+        else None
+    )
+    dwell = (
+        float(rep.bottom_dwell_time)
+        if rep.bottom_dwell_time is not None and np.isfinite(rep.bottom_dwell_time)
+        else np.nan
+    )
+    reversal_frames = (
+        int(rep.direction_reversal_frames)
+        if rep.direction_reversal_frames is not None else 999
+    )
 
-    # ── 计算 rebound_ratio（反弹比）：post_speed / pre_speed ──
-    rebound_ratio = _compute_rebound_ratio(rep)
+    # ── 阈值定义（V3.4） ──
+    FAST_APPROACH = 400.0
+    MODERATE_APPROACH = 300.0
+    SHORT_DWELL = 0.08
+    RAPID_REVERSAL = 2
+    HIGH_RECOVERY = 0.50
+    EXTREME_RECOVERY = 0.65
+    RAPID_REBOUND_LATENCY = 3
 
-    # ── 信号 1: 快速接近 ──
-    fast_approach = approach_speed >= 180.0
-    approach_label = "[FAST]" if fast_approach else "[NORMAL]"
+    # ── 基础信号 ──
+    fast_approach = approach >= FAST_APPROACH
+    moderate_approach = approach >= MODERATE_APPROACH
+    short_dwell = np.isfinite(dwell) and dwell <= SHORT_DWELL
+    rapid_reversal = reversal_frames <= RAPID_REVERSAL
+    high_recovery = recovery is not None and recovery >= HIGH_RECOVERY
+    extreme_recovery = recovery is not None and recovery >= EXTREME_RECOVERY
+    rapid_rebound = latency is not None and latency <= RAPID_REBOUND_LATENCY
 
-    # ── 信号 2: 极短底部停留 ──
-    short_dwell = np.isfinite(dwell) and dwell <= 0.08
-    dwell_label = "[SHORT]" if short_dwell else "[NORMAL]"
-
-    # ── 信号 3: 快速方向反转 ──
-    rapid_reversal = reversal_frames <= 2
-    reversal_label = "[RAPID]" if rapid_reversal else "[NORMAL]"
-
-    # ── 信号 4: 底部异常加速度 ──
-    high_accel = np.isfinite(acceleration) and abs(acceleration) >= 3000.0
-    accel_label = "[HIGH]" if high_accel else "[NORMAL]"
-
-    # ── 信号 5: 高反弹比（撞击后弹起）──
-    high_rebound = rebound_ratio is not None and rebound_ratio >= 0.85
-    rebound_label = "[HIGH]" if high_rebound else "[NORMAL]"
+    # ── V3.4: 多证据 impact_score ──
+    impact_score = 0
+    if fast_approach:
+        impact_score += 2
+    elif moderate_approach:
+        impact_score += 1
+    if high_recovery:
+        impact_score += 2
+    if extreme_recovery:
+        impact_score += 1
+    if rapid_rebound:
+        impact_score += 2
+    if short_dwell:
+        impact_score += 1
+    if rapid_reversal:
+        impact_score += 1
 
     # ── 诊断日志 ──
     if verbose:
-        print(f"\n   🔻 [Bounce V3.1] Rep {rep.rep_index} 诊断:")
-        print(f"   🔻   approach_speed = {approach_speed:.0f}°/s   {approach_label}")
+        print(f"\n   🔻 [Bounce V3.4] Rep {rep.rep_index}")
+        approach_label = "[FAST]" if fast_approach else "[MODERATE]" if moderate_approach else "[NORMAL]"
+        print(f"   🔻   approach={approach:.1f}°/s {approach_label}")
+        if post_peak is not None:
+            print(f"   🔻   post_peak={post_peak:.1f}°/s")
+        else:
+            print(f"   🔻   post_peak=N/A")
+        if recovery is not None:
+            recovery_label = "[EXTREME]" if extreme_recovery else "[HIGH]" if high_recovery else "[NORMAL]"
+            print(f"   🔻   recovery={recovery:.2f} {recovery_label}")
+        else:
+            print(f"   🔻   recovery=N/A")
+        if latency is not None:
+            print(f"   🔻   rebound_latency={latency}f {'[RAPID]' if rapid_rebound else '[NORMAL]'}")
+        else:
+            print(f"   🔻   rebound_latency=N/A")
         if np.isfinite(dwell):
-            print(f"   🔻   bottom_dwell   = {dwell*1000:.0f}ms   {dwell_label}")
+            print(f"   🔻   dwell={dwell*1000:.0f}ms {'[SHORT]' if short_dwell else '[NORMAL]'}")
         else:
-            print(f"   🔻   bottom_dwell   = N/A")
-        print(f"   🔻   reversal       = {reversal_frames}f   {reversal_label}")
-        if np.isfinite(acceleration):
-            print(f"   🔻   acceleration   = {acceleration:.0f}°/s²   {accel_label}")
-        else:
-            print(f"   🔻   acceleration   = N/A")
-        if rebound_ratio is not None:
-            print(f"   🔻   rebound_ratio  = {rebound_ratio:.2f}   {rebound_label}")
-        else:
-            print(f"   🔻   rebound_ratio  = N/A")
-
-    hits = sum([fast_approach, short_dwell, rapid_reversal, high_accel, high_rebound])
-    details = []
-    if fast_approach:
-        details.append(f"approach={approach_speed:.0f}°/s")
-    if short_dwell:
-        details.append(f"dwell={dwell*1000:.0f}ms")
-    if rapid_reversal:
-        details.append(f"reversal={reversal_frames}f")
-    if high_accel:
-        details.append(f"accel={abs(acceleration):.0f}°/s²")
-    if high_rebound:
-        details.append(f"rebound={rebound_ratio:.2f}")
-
-    if verbose:
-        print(f"   🔻   signals = {hits}/5  →  ", end="")
+            print(f"   🔻   dwell=N/A")
+        print(f"   🔻   reversal={reversal_frames}f {'[RAPID]' if rapid_reversal else '[NORMAL]'}")
+        print(f"   🔻   impact_score={impact_score}")
 
     # ═══════════════════════════════════════
-    # Severe Bounce: >=3 个信号命中
+    # 第一层：Context Gate
+    # 没有足够的接近速度，绝不能判 Bounce
     # ═══════════════════════════════════════
-    if hits >= 3:
+    if not moderate_approach:
         if verbose:
-            print("SEVERE BOUNCE")
-        return ErrorDetection(
-            eid, rep.rep_index, ErrorStatus.DETECTED,
-            ErrorSeverity.SEVERE, value=approach_speed,
-            threshold=180.0, confidence=0.90,
-            detail="明显弹震: " + "; ".join(details),
-        )
-
-    # ═══════════════════════════════════════
-    # Moderate Bounce: fast_approach + 至少 1 个其他强烈信号
-    # ═══════════════════════════════════════
-    if fast_approach and (short_dwell or rapid_reversal or high_accel or high_rebound):
-        if verbose:
-            print("MODERATE BOUNCE")
-        return ErrorDetection(
-            eid, rep.rep_index, ErrorStatus.DETECTED,
-            ErrorSeverity.MODERATE, value=approach_speed,
-            threshold=180.0, confidence=0.75,
-            detail="疑似弹震: " + "; ".join(details),
-        )
-
-    # ═══════════════════════════════════════
-    # Touch & Go: 短停留 + 快速反转，但接近速度正常
-    # ═══════════════════════════════════════
-    if short_dwell and not fast_approach and rapid_reversal:
-        if verbose:
-            print("TOUCH & GO (正常)")
+            print("   🔻   → NORMAL (接近速度不足以支持 Bounce)")
         return ErrorDetection(
             eid, rep.rep_index, ErrorStatus.NOT_DETECTED,
-            value=approach_speed, threshold=180.0, confidence=0.80,
-            detail="Touch & Go: " + "; ".join(details) if details else "正常触胸即起",
+            value=approach, threshold=MODERATE_APPROACH, confidence=0.93,
+            detail=f"接近速度不足以支持 Bounce: approach={approach:.1f}°/s (<{MODERATE_APPROACH})",
+        )
+
+    # ═══════════════════════════════════════
+    # Severe Bounce
+    # fast_approach + high_recovery + (rapid_rebound or (short_dwell and rapid_reversal)) + impact_score>=6
+    # ═══════════════════════════════════════
+    if (fast_approach and high_recovery
+            and (rapid_rebound or (short_dwell and rapid_reversal))
+            and impact_score >= 6):
+        if verbose:
+            print("   🔻   → SEVERE BOUNCE (疑似)")
+        detail_parts = [f"approach={approach:.0f}°/s"]
+        if post_peak is not None:
+            detail_parts.append(f"post={post_peak:.0f}°/s")
+        if recovery is not None:
+            detail_parts.append(f"recovery={recovery:.2f}")
+        if latency is not None:
+            detail_parts.append(f"latency={latency}f")
+        return ErrorDetection(
+            eid, rep.rep_index, ErrorStatus.DETECTED,
+            ErrorSeverity.SEVERE, value=approach,
+            threshold=FAST_APPROACH, confidence=0.90,
+            detail="疑似高速砸胸反弹: " + ", ".join(detail_parts),
+        )
+
+    # ═══════════════════════════════════════
+    # Moderate Bounce
+    # moderate_approach + high_recovery + (rapid_rebound or (short_dwell and rapid_reversal)) + impact_score>=4
+    # ═══════════════════════════════════════
+    if (moderate_approach and high_recovery
+            and (rapid_rebound or (short_dwell and rapid_reversal))
+            and impact_score >= 4):
+        if verbose:
+            print("   🔻   → MODERATE BOUNCE (疑似)")
+        recovery_text = f"{recovery:.2f}" if recovery is not None else "N/A"
+        return ErrorDetection(
+            eid, rep.rep_index, ErrorStatus.DETECTED,
+            ErrorSeverity.MODERATE, value=approach,
+            threshold=MODERATE_APPROACH, confidence=0.82,
+            detail=(
+                f"疑似底部弹震: approach={approach:.0f}°/s, "
+                f"recovery={recovery_text}, impact_score={impact_score}"
+            ),
+        )
+
+    # ═══════════════════════════════════════
+    # Touch & Go
+    # short_dwell + rapid_reversal + NOT high_recovery + approach<400
+    # ═══════════════════════════════════════
+    if short_dwell and rapid_reversal and not high_recovery and approach < FAST_APPROACH:
+        if verbose:
+            print("   🔻   → TOUCH & GO (正常)")
+        return ErrorDetection(
+            eid, rep.rep_index, ErrorStatus.NOT_DETECTED,
+            value=approach, threshold=MODERATE_APPROACH, confidence=0.90,
+            detail=f"Touch & Go: approach={approach:.0f}°/s (无高恢复证据)",
         )
 
     # ═══════════════════════════════════════
     # Normal
     # ═══════════════════════════════════════
     if verbose:
-        print("NORMAL")
+        print("   🔻   → NORMAL")
     return ErrorDetection(
         eid, rep.rep_index, ErrorStatus.NOT_DETECTED,
-        value=approach_speed, threshold=180.0, confidence=0.80,
-        detail="正常底部控制" + (": " + "; ".join(details) if details else ""),
+        value=approach, threshold=MODERATE_APPROACH, confidence=0.85,
+        detail="正常底部控制",
     )
-
-
-def _compute_rebound_ratio(rep: RepContext) -> Optional[float]:
-    """
-    V3.1: 计算反弹比 = post_bottom_speed / pre_bottom_speed。
-
-    用 rep.bilateral_elbow（rep-relative 角度序列）计算。
-    bottom 前 3 帧的 |velocity| median vs bottom 后 3 帧的 |velocity| median。
-    """
-    if rep.bilateral_elbow is None:
-        return None
-
-    angles = np.asarray(rep.bilateral_elbow, dtype=float)
-    if len(angles) < 7:
-        return None
-
-    bf_rel = rep.bottom_frame - rep.start_frame
-    if bf_rel <= 0 or bf_rel >= len(angles) - 1:
-        return None
-
-    vel = np.gradient(angles, 1.0 / rep.fps)
-
-    pre_start = max(0, bf_rel - 3)
-    pre_vel = vel[pre_start:bf_rel]
-    pre_vel = pre_vel[np.isfinite(pre_vel)]
-    if len(pre_vel) == 0:
-        return None
-    pre_speed = float(np.nanmedian(np.abs(pre_vel)))
-
-    post_end = min(len(vel), bf_rel + 4)
-    post_vel = vel[bf_rel + 1:post_end]
-    post_vel = post_vel[np.isfinite(post_vel)]
-    if len(post_vel) == 0:
-        return None
-    post_speed = float(np.nanmedian(np.abs(post_vel)))
-
-    if pre_speed <= 1e-6:
-        return 0.0
-
-    return float(post_speed / pre_speed)
 
 
 def detect_butt_off_bench(rep: RepContext) -> ErrorDetection:

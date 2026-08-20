@@ -370,27 +370,55 @@
                 "利用弹力反弹会降低目标肌肉的张力持续时间"
             ],
             "detect": {
-                "method": "multi_signal_bottom_impact",
+                "method": "bounce_v34_multi_evidence_detector",
+                "version": "V3.4",
                 "signals": [
-                    "approach_speed (pre_bottom_velocity, 卧推下放时已取负号使快速下放为正值)",
-                    "bottom_dwell_time (基于 near-zero velocity 的真实停留时间，不再是固定窗口长度)",
-                    "direction_reversal_frames (真正计算方向反转用了多少帧，不再是 0/1)",
-                    "bottom_acceleration (真正的二阶导数 d(velocity)/dt，单位 °/s²)",
-                    "rebound_ratio (post_bottom_speed / pre_bottom_speed，撞击反弹比)"
+                    "pre_bottom_peak_speed (bottom前0.20s窗口的85th percentile |velocity|，避开极值点附近低速帧)",
+                    "post_bottom_peak_speed (bottom后0.20s窗口的85th percentile |velocity|)",
+                    "impact_recovery_ratio (post_peak / pre_peak，pre_peak>=80时才计算，>=0.50可疑)",
+                    "velocity_drop_ratio (1 - recovery_ratio)",
+                    "rebound_latency_frames (bottom→向心速度达pre_peak*40%所需帧数，<=3可疑)",
+                    "bottom_dwell_time (基于 near-zero velocity 的真实停留时间)",
+                    "direction_reversal_frames (真正计算方向反转用了多少帧)"
                 ],
                 "logic": {
-                    "severe": ">=3 个信号命中",
-                    "moderate": "fast_approach AND 至少 1 个其他强烈信号",
-                    "touch_and_go": "short_dwell AND NOT fast_approach AND rapid_reversal (正常训练变式，不报错)",
-                    "normal": "其他情况"
+                    "layer1_context_gate": {
+                        "required": "pre_bottom_peak_speed >= 300 °/s",
+                        "if_failed": "直接 NOT_DETECTED（接近速度不足以支持 Bounce）"
+                    },
+                    "layer2_multi_evidence": {
+                        "core_principle": "Bounce = 高速接近 + 高速恢复 + 快速反弹 + 短停留（多证据评分，不再依赖单一 ratio 硬门槛）",
+                        "impact_score": "fast_approach(+2) / moderate_approach(+1) + high_recovery(+2) + extreme_recovery(+1) + rapid_rebound(+2) + short_dwell(+1) + rapid_reversal(+1)",
+                        "severe": "fast_approach(>=400) AND high_recovery(>=0.50) AND (rapid_rebound OR (short_dwell AND rapid_reversal)) AND impact_score>=6",
+                        "moderate": "moderate_approach(>=300) AND high_recovery(>=0.50) AND (rapid_rebound OR (short_dwell AND rapid_reversal)) AND impact_score>=4",
+                        "touch_and_go": "short_dwell AND rapid_reversal AND NOT high_recovery AND approach<400 (正常训练变式，不报错)",
+                        "normal": "其他情况"
+                    }
                 },
                 "thresholds": {
-                    "approach_speed": ">=180 °/s",
+                    "fast_approach": ">=400 °/s (peak speed)",
+                    "moderate_approach": ">=300 °/s (peak speed)",
+                    "high_recovery": ">=0.50",
+                    "extreme_recovery": ">=0.65",
+                    "rapid_rebound_latency": "<=3 frames",
                     "bottom_dwell": "<=0.08s",
                     "reversal_frames": "<=2",
-                    "acceleration": ">=3000 °/s²",
-                    "rebound_ratio": ">=0.85"
+                    "recovery_pre_peak_gate": "pre_peak >= 80 °/s 时才计算 recovery_ratio",
+                    "rebound_latency_target": "向心速度达 max(80, pre_peak*0.40) °/s"
                 },
+                "v3.4_fixes": [
+                    "修复V3.3漏检：recovery=0.55<0.75导致462°/s+0ms+1f被判成Touch&Go",
+                    "recovery门槛从0.75降到0.50(high)/0.65(extreme)，不再作为硬门槛",
+                    "approach门槛从180/250改成300/400(用peak speed)",
+                    "新增rebound_latency_frames(bottom→向心速度达pre_peak*40%所需帧数)，比direction_reversal_frames强很多",
+                    "用impact_score多证据评分(满分10)，不再依赖单一recovery ratio",
+                    "产品文案用'疑似砸胸/弹胸'而非'确认砸胸'(单目2D无法真正证明撞击)",
+                    "删除已deprecated的_compute_rebound_ratio函数，避免信号源不一致"
+                ],
+                "deprecated_signals": [
+                    "bottom_acceleration (仍计算但不再作为Bounce判定依据，噪声太大)",
+                    "direction_reversal_frames (仍计算但信息量低，被rebound_latency_frames替代为主)"
+                ],
                 "at_frame": "bottom"
             },
             "severity_levels": {

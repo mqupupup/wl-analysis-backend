@@ -1180,6 +1180,44 @@ class PhaseBuilder:
 
         return max(0, post_idx - pre_idx - 1)
 
+    def _compute_rebound_latency(
+        self,
+        angles: np.ndarray,
+        bottom_idx: int,
+        pre_peak_speed: Optional[float],
+    ) -> Optional[int]:
+        """
+        V3.4: 计算反弹恢复延迟（帧数）。
+        从 bottom+1 开始，找到第一个向心速度 >= max(80, pre_peak*0.40) 的帧。
+        最多搜索 0.20s。返回帧数间隔，None 表示未达到目标速度。
+
+        这个特征比 direction_reversal_frames（只判断方向是否反转）强很多，
+        因为它衡量的是"底部后多久恢复到有效向心速度"。
+        """
+        if pre_peak_speed is None or pre_peak_speed < 80.0:
+            return None
+        if bottom_idx <= 0 or bottom_idx >= len(angles) - 1:
+            return None
+
+        target = max(80.0, pre_peak_speed * 0.40)
+        max_search = min(len(angles) - bottom_idx - 1, int(0.20 * self.fps))
+        if max_search < 1:
+            return None
+
+        # 计算 bottom 之后的 velocity（包含 bottom 帧，gradient 需要至少 2 点）
+        post_seg = angles[bottom_idx:bottom_idx + max_search + 2]
+        if len(post_seg) < 2:
+            return None
+        post_vel = np.gradient(post_seg, 1.0 / self.fps)
+
+        # 从 bottom+1 开始搜索（post_vel[0] 对应 bottom 帧本身的 velocity）
+        for i in range(1, len(post_vel)):
+            v = post_vel[i]
+            if np.isfinite(v) and v >= target:
+                return i  # i 帧后达到目标速度
+
+        return None
+
     def build(
         self,
         rep_index: int,
@@ -1266,26 +1304,53 @@ class PhaseBuilder:
         #    取负号使快速下放为正值，用 median 抗 jitter
         # 2. bottom_acceleration: 真正的二阶导数 d(velocity)/dt，单位 °/s²
         # 3. direction_reversal_frames: 真正计算反转用了多少帧，不再是 0/1
+        # V3.3: 新增 peak speed + recovery ratio，用 85th percentile 避开极值点
         pre_bot_vel = bot_accel = None
+        pre_bot_peak = post_bot_peak = None
+        impact_recovery = velocity_drop = None
+        rebound_latency = None
         dir_reversal = 999  # 默认值，表示无法计算
         if bf > 0 and bf < n - 1:
-            window = max(2, int(0.05 * self.fps))
-            pre_seg = angles[max(0, bf - window):bf]
-            post_seg = angles[bf:min(n, bf + window + 1)]
+            # V3.3: 用较宽的对称窗口，85th percentile 自然避开 bottom 极值点附近的低速
+            pre_frames = max(6, int(0.20 * self.fps))
+            post_frames = max(6, int(0.20 * self.fps))
+            pre_seg = angles[max(0, bf - pre_frames):bf]
+            post_seg = angles[bf + 1:min(n, bf + post_frames + 1)]
 
-            if len(pre_seg) > 1:
+            # ── pre_bottom_velocity（median，保留 backward compatibility）──
+            if len(pre_seg) >= 3:
                 pre_vel_series = np.gradient(pre_seg, 1.0 / self.fps)
-                # 取负号：下放时 velocity < 0，快速下放 → pre_bottom_velocity > 0
-                pre_bot_vel = float(-np.nanmedian(pre_vel_series))
+                pre_vel_series = pre_vel_series[np.isfinite(pre_vel_series)]
+                if len(pre_vel_series) >= 3:
+                    # 取负号：下放时 velocity < 0，快速下放 → pre_bottom_velocity > 0
+                    pre_bot_vel = float(-np.nanmedian(pre_vel_series))
+                    # V3.3: 85th percentile |velocity|，避开极值点附近的低速
+                    pre_bot_peak = float(np.percentile(np.abs(pre_vel_series), 85))
 
-            if len(post_seg) > 1:
+            # ── post_bottom_peak_speed + bottom_acceleration ──
+            if len(post_seg) >= 3:
                 post_vel = np.gradient(post_seg, 1.0 / self.fps)
+                post_vel_valid = post_vel[np.isfinite(post_vel)]
+                if len(post_vel_valid) >= 3:
+                    # V3.3: 85th percentile |velocity|
+                    post_bot_peak = float(np.percentile(np.abs(post_vel_valid), 85))
                 # 真正的加速度 = d(velocity)/dt
                 post_accel = np.gradient(post_vel, 1.0 / self.fps)
-                bot_accel = float(np.nanmedian(post_accel))
+                post_accel = post_accel[np.isfinite(post_accel)]
+                if len(post_accel) >= 3:
+                    bot_accel = float(np.nanmedian(post_accel))
+
+            # ── V3.3: impact_recovery_ratio = post_peak / pre_peak ──
+            if (pre_bot_peak is not None and post_bot_peak is not None
+                    and pre_bot_peak >= 80.0):
+                impact_recovery = float(post_bot_peak / max(pre_bot_peak, 1e-6))
+                velocity_drop = float(1.0 - impact_recovery)
 
             # 真正计算方向反转帧数
             dir_reversal = self._compute_reversal_frames(angles, bf)
+
+            # V3.4: 计算反弹恢复延迟（bottom→向心速度达pre_peak*40%所需帧数）
+            rebound_latency = self._compute_rebound_latency(angles, bf, pre_bot_peak)
 
         le_slice = right_elbow_slice = bilat_slice = None
         left_wrist_slice = right_wrist_slice = None
@@ -1399,6 +1464,11 @@ class PhaseBuilder:
             mean_concentric_velocity=mean_con,
             pre_bottom_velocity=pre_bot_vel, bottom_acceleration=bot_accel,
             direction_reversal_frames=dir_reversal,
+            pre_bottom_peak_speed=pre_bot_peak,
+            post_bottom_peak_speed=post_bot_peak,
+            impact_recovery_ratio=impact_recovery,
+            velocity_drop_ratio=velocity_drop,
+            rebound_latency_frames=rebound_latency,
             left_elbow=le_slice, right_elbow=right_elbow_slice,
             bilateral_elbow=bilat_slice,
             bilateral_valid_ratio=bilateral_valid_ratio,
