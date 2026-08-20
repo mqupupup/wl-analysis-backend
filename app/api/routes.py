@@ -111,9 +111,11 @@ async def merge_and_analyze(request: MergeAnalyzeRequest):
         analysis_result = biomechanics_analyze(video_path)
         
         # 4. 返回结果，前端期望 exercise_type / thumbnailUrl 等在根级别
+        video_url = f"/uploads/{session_id}/{video_path.name}"
         return {
-            "success": True, 
+            "success": True,
             "thumbnailUrl": thumbnail_url,
+            "video_url": video_url,
             **analysis_result
         }
     
