@@ -312,7 +312,12 @@ class BiomechanicsEngine:
                 "fatigue_level": fatigue_result.fatigue_level,
                 "trend": fatigue_result.trend,
                 "status": fatigue_result.status,
-                "velocity_curve": [],
+                "velocity_curve": [
+                    round(ctx.mean_concentric_velocity, 2)
+                    for ctx in contexts
+                    if ctx.mean_concentric_velocity is not None
+                    and ctx.mean_concentric_velocity > 0
+                ],
             },
             "skeleton_frames": skeleton_frames,
             "key_frames": key_frames,
